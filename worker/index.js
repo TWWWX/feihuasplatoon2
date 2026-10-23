@@ -51,10 +51,9 @@ export class GameRoom {
       stale.close(4000, '席位被新连接顶替')
     }
 
-    server.accept()
+    /* Hibernation 模式：只允许 state.acceptWebSocket()，不能再手动 accept()（二者互斥） */
     this.state.acceptWebSocket(server)
     server.serializeAttachment({ joinedAt: now, lastSeen: now, clientId: null })
-
     /* roomId 兜底：hibernate 唤醒后构造器重跑、this.roomId 为空，从 storage 恢复 */
     if (this.roomId) await this.state.storage.put('room_id', this.roomId)
 
