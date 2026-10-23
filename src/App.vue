@@ -231,10 +231,60 @@ function applyRoomSnapshot(st) {
 }
 
 /* ---- 把本地最新状态整体推给 DO（提交/放弃/撤销/结算/开局/重抽/改名/占席共用） ----
-   方案 B：消息即整份 state，DO 原样广播给对方并异步持久化（storage + D1） */
+   方案 B：DO 原样广播 + 异步持久化（storage + D1）。
+   消息分两类（worker 按类型决定落盘策略）：
+   - full_state：全量快照（建房/加入/撤销/重开/重铺/设置变更/席位变更）
+   - patch_state：增量（提交/放弃/修正模式），只带 board/回合/分数/新增记录，长局不膨胀 */
 function syncState() {
   if (!roomCode.value) return
-  sendRaw(JSON.stringify(localToCloudState()))
+  sendRaw(JSON.stringify({ type: 'full_state', state: localToCloudState() }))
+}
+/* 增量同步：newLogs 为本次新产生的 log 项（本地形态），序列化时复用 localToCloudState 的映射口径 */
+function syncPatch(newLogs) {
+  if (!roomCode.value) return
+  const full = localToCloudState()
+  const n = (newLogs || []).length
+  sendRaw(
+    JSON.stringify({
+      type: 'patch_state',
+      patch: {
+        board: full.board,
+        round: full.round,
+        currentTurn: full.currentTurn,
+        redScore: full.redScore,
+        blueScore: full.blueScore,
+        historyAppend: n ? full.history.slice(-n) : [],
+      },
+    })
+  )
+}
+/* 接收入口：full_state / patch_state 解包；裸 state（DO hibernation 回放形态）直接整体覆盖 */
+function onCloudMessage(st) {
+  if (st && st.type === 'full_state') {
+    applyRoomSnapshot(st.state)
+    return
+  }
+  if (st && st.type === 'patch_state') {
+    applyPatch(st.patch)
+    return
+  }
+  applyRoomSnapshot(st)
+}
+/* 增量应用（云端形态 → 本地）：board 覆盖 + 回合反推 + 记录追加；phase 等结构变化走 full_state */
+function applyPatch(p) {
+  if (!p || typeof p !== 'object') return
+  if (Array.isArray(p.board)) {
+    gameState.board = p.board.map((c) => ({
+      ch: c.ch,
+      owner: c.owner === 'red' ? 'A' : c.owner === 'blue' ? 'B' : null,
+    }))
+  }
+  if (typeof p.round === 'number' && p.currentTurn) {
+    gameState.turnNo = (p.round - 1) * 2 + (p.currentTurn === 'blue' ? 2 : 1)
+  }
+  for (const e of p.historyAppend || []) {
+    gameState.log.push({ ...e, team: e.team === 'red' ? 'A' : e.team === 'blue' ? 'B' : e.team })
+  }
 }
 
 /* ---- 在线状态（事件驱动：peers 快照 + peer_online/peer_offline 推送） ----
@@ -383,7 +433,7 @@ function enterRoom(code, asHost) {
   connectWs(code, {
     clientId: uid,
     onOpen: onWsOpen,
-    onMessage: (st) => applyRoomSnapshot(st),
+    onMessage: (st) => onCloudMessage(st),
     onPeers: onPeers,
     onPeerOnline: onPeerOnline,
     onPeerOffline: onPeerOffline,
@@ -830,7 +880,7 @@ function onCellClick(idx) {
   const cur = gameState.board[idx].owner
   const next = order[(order.indexOf(cur) + 1) % 3]
   gameState.board[idx].owner = next
-  syncState()
+  syncPatch([])
   flashTip(`修正：${gameState.board[idx].ch} → ${next ? teamNames.value[next] : '无主'}`, 'ok')
 }
 
@@ -986,7 +1036,7 @@ async function submitLine() {
       'ok'
     )
     advance()
-    syncState()
+    syncPatch([gameState.log[gameState.log.length - 1]])
   } finally {
     submitting = false
   }
@@ -1014,7 +1064,7 @@ function passTurn() {
   gameState.log.push({ type: 'pass', team: me, round: currentRound.value })
   flashTip(`已记录：${teamNames.value[me]} 放弃本回合，未涂色。`, 'warn')
   advance()
-  syncState()
+  syncPatch([gameState.log[gameState.log.length - 1]])
 }
 
 function undo() {

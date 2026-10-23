@@ -150,17 +150,38 @@ export class GameRoom {
       }
     }
 
-    /* ---- 游戏消息：先广播（低延迟），持久化不阻塞下行 ---- */
+    /* ---- 游戏消息：先广播（低延迟），持久化不阻塞下行 ----
+       full_state：全量快照（建房/加入/撤销/重开/设置等）→ 原样落盘
+       patch_state：增量（提交/放弃/修正）→ 广播给对方 + 合并进最近全量后落盘
+       其余 JSON（裸 state，兼容旧消息 / DO 回放形态）：原样广播 + 原样落盘 */
+    if (ctrl && ctrl.type === 'full_state') {
+      this.broadcast(ws, message)
+      const p = this.persist(JSON.stringify(ctrl.state))
+      if (this.state.waitUntil) this.state.waitUntil(p)
+      else p.catch(() => {})
+      return
+    }
+    if (ctrl && ctrl.type === 'patch_state') {
+      this.broadcast(ws, message)
+      const p = this.mergePersist(ctrl.patch)
+      if (this.state.waitUntil) this.state.waitUntil(p)
+      else p.catch(() => {})
+      return
+    }
+    this.broadcast(ws, message)
+    const p = this.persist(message)
+    if (this.state.waitUntil) this.state.waitUntil(p)
+    else p.catch(() => {})
+  }
+
+  broadcast(from, message) {
     for (const other of this.state.getWebSockets()) {
-      if (other !== ws) {
+      if (other !== from) {
         try {
           other.send(message)
         } catch {}
       }
     }
-    const p = this.persist(message)
-    if (this.state.waitUntil) this.state.waitUntil(p)
-    else p.catch(() => {})
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
@@ -202,6 +223,38 @@ export class GameRoom {
     } catch (e) {
       console.error('storage put failed', e)
     }
+    await this.saveD1(message, now)
+  }
+
+  /* 增量落盘：把 patch 合并进最近的全量快照——storage 始终保有完整 state，
+     hibernation 回放直接给全量，无需补丁链。无基础快照（新房间还没发过 full_state）时跳过，等下一条 full_state。 */
+  async mergePersist(patch) {
+    try {
+      const raw = await this.state.storage.get('room_state')
+      const last = raw ? JSON.parse(raw) : null
+      if (!last || typeof last !== 'object') return
+      if (Array.isArray(patch.board)) last.board = patch.board
+      if (typeof patch.round === 'number') last.round = patch.round
+      if (patch.currentTurn) last.currentTurn = patch.currentTurn
+      if (typeof patch.redScore === 'number') last.redScore = patch.redScore
+      if (typeof patch.blueScore === 'number') last.blueScore = patch.blueScore
+      if (Array.isArray(patch.historyAppend) && patch.historyAppend.length) {
+        last.history = (last.history || []).concat(patch.historyAppend)
+      }
+      const now = Date.now()
+      const merged = JSON.stringify(last)
+      try {
+        await this.state.storage.put({ room_state: merged, room_saved_at: now })
+      } catch (e) {
+        console.error('storage put failed', e)
+      }
+      await this.saveD1(merged, now)
+    } catch (e) {
+      console.error('merge persist failed', e)
+    }
+  }
+
+  async saveD1(stateStr, now) {
     try {
       const rid = this.roomId || (await this.state.storage.get('room_id'))
       if (!rid) return
@@ -209,7 +262,7 @@ export class GameRoom {
         `INSERT INTO rooms (room_id, state, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(room_id) DO UPDATE SET state = ?2, updated_at = ?3`
       )
-        .bind(rid, message, now)
+        .bind(rid, stateStr, now)
         .run()
     } catch (e) {
       console.error('d1 save failed', e)
