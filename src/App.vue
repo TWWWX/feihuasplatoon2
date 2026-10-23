@@ -164,6 +164,8 @@ function localToCloudState() {
     totalRounds: 0,
     endless: true,
     poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0),
+    poolRemoved: gameState.poolRemoved || '',
+    poolAdded: gameState.poolAdded || '',
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -190,6 +192,8 @@ function cloudToLocalState(st) {
     totalRounds: 0,
     endless: true,
     poolMask: typeof st.poolMask === 'number' ? st.poolMask : 511,
+    poolRemoved: typeof st.poolRemoved === 'string' ? st.poolRemoved : '',
+    poolAdded: typeof st.poolAdded === 'string' ? st.poolAdded : '',
     board: (st.board || []).map((c) => ({
       ch: c.ch,
       owner: c.owner === 'red' ? 'A' : c.owner === 'blue' ? 'B' : null,
@@ -222,6 +226,8 @@ function applyRoomSnapshot(st) {
   gameState.totalRounds = local.totalRounds
   gameState.endless = local.endless
   applyPoolMask(local.poolMask)
+  gameState.poolRemoved = local.poolRemoved
+  gameState.poolAdded = local.poolAdded
   gameState.board = local.board
   gameState.turnNo = local.turnNo
   gameState.log = local.log
@@ -690,6 +696,8 @@ const gameState = reactive({
   totalRounds: 0, // 固定 0（保留字段兼容旧存档同步协议，不再使用）
   endless: true,
   turnNo: 1, // 1-based 总出手次数
+  poolRemoved: '', // 手动换字：从基础字库移除的字（与 poolAdded 数量守恒）
+  poolAdded: '', // 手动换字：从额外字池补入的字
   log: [], // 飞花 / 放弃记录
   undoStack: [],
 })
@@ -749,6 +757,56 @@ const activePool = computed(() => {
   return out
 })
 const activePoolSet = computed(() => new Set(activePool.value))
+/* 生效字库 = 基础字库 − 手动移除 + 手动补入（换字守恒：移除数 == 补入数才能开局） */
+const removedSet = computed(() => new Set(Array.from(gameState.poolRemoved)))
+const addedSet = computed(() => new Set(Array.from(gameState.poolAdded)))
+const removedArr = computed(() => Array.from(gameState.poolRemoved))
+const addedArr = computed(() => Array.from(gameState.poolAdded))
+const effectivePoolView = computed(() => {
+  /* 展示用：基础库 + 补入（含已移除的字，标删除线可恢复） */
+  const out = []
+  const seen = new Set()
+  const push = (arr) => {
+    for (const ch of arr) if (!seen.has(ch)) { seen.add(ch); out.push(ch) }
+  }
+  push(activePool.value)
+  push(Array.from(gameState.poolAdded))
+  return out
+})
+const effectivePool = computed(() => {
+  /* 抽盘用：展示列表去掉已移除的字 */
+  const rm = removedSet.value
+  return effectivePoolView.value.filter((ch) => !rm.has(ch))
+})
+const effectivePoolSet = computed(() => new Set(effectivePool.value))
+/* 候选字：额外字池中不在生效字库、也尚未补入的字，按频次降序取前 300 */
+const extraCandidates = computed(() =>
+  EXTRA.filter((ch) => !effectivePoolSet.value.has(ch) && !addedSet.value.has(ch))
+    .sort((a, b) => (EXTRA_FREQ[b] || 0) - (EXTRA_FREQ[a] || 0))
+    .slice(0, 300)
+)
+function toggleRemoveChar(ch) {
+  if (gameState.phase !== 'ready') return
+  gameState.poolRemoved = gameState.poolRemoved.includes(ch)
+    ? gameState.poolRemoved.replace(ch, '')
+    : gameState.poolRemoved + ch
+  redrawBoard()
+  syncState()
+}
+function toggleAddChar(ch) {
+  if (gameState.phase !== 'ready') return
+  if (addedSet.value.has(ch)) {
+    gameState.poolAdded = gameState.poolAdded.replace(ch, '')
+  } else {
+    if (addedArr.value.length >= removedArr.value.length) {
+      flashTip('补入数不能超过移除数：先在基础字库中移除一个字，再补入。', 'warn')
+      return
+    }
+    gameState.poolAdded += ch
+  }
+  redrawBoard()
+  syncState()
+}
 const extraAvail = computed(() => EXTRA.reduce((n, ch) => (activePoolSet.value.has(ch) ? n : n + 1), 0))
 function togglePool(key) {
   if (gameState.phase !== 'ready') return
@@ -818,7 +876,7 @@ const poolOn = computed(() => {
   return m
 })
 const extraOnBoard = computed(() => {
-  const sel = activePoolSet.value
+  const sel = effectivePoolSet.value
   const ex = gameState.board.filter((c) => !sel.has(c.ch)).map((c) => c.ch)
   ex.sort((x, y) => (EXTRA_FREQ[y] || 0) - (EXTRA_FREQ[x] || 0))
   return ex
@@ -870,7 +928,7 @@ function redrawBoard(seed = Math.floor(Math.random() * 2 ** 31)) {
   const extraN = Math.max(0, Math.min(cap, parseInt(extraInput.value, 10) || 0))
   extraInput.value = extraN
   gameState.seed = seed
-  gameState.board = buildBoard(seed, gameState.side, extraN, activePool.value)
+  gameState.board = buildBoard(seed, gameState.side, extraN, effectivePool.value)
   previewSet.value = new Set()
   changedNow.value = {}
 }
@@ -1255,6 +1313,10 @@ function redrawOrAgain() {
 const redrawLabel = computed(() => (gameState.phase === 'over' ? '再来一局' : '重抽棋盘'))
 function startGame() {
   if (gameState.phase === 'playing') return
+  if (removedArr.value.length !== addedArr.value.length) {
+    flashTip(`换字未完成：已移除 ${removedArr.value.length} 字、已补入 ${addedArr.value.length} 字，两者相等（含 0=0）才能开局。`, 'err')
+    return
+  }
   /* 改了尺寸但没触发 change：先按新尺寸重铺，否则会拿旧棋盘开局 */
   const n = clampSizeInput()
   if (n !== gameState.side) {
@@ -1477,6 +1539,19 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                 <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] }">{{ ch }}</span>
               </div>
               <p class="poolnote">勾选的字库集合取并集去重后构成基础字库；对局中不可调整，开局前双方均可切换并自动重抽。</p>
+              <div class="swap-head">手动换字（移除 {{ removedArr.length }} 字 · 补入 {{ addedArr.length }} 字{{ removedArr.length === addedArr.length ? ' · 可开局' : ' · 需相等才能开局' }}）</div>
+              <p class="poolnote">点击下方字块「移除/恢复」；从候选区点击「补入」。补入数不能超过移除数，两者相等（含 0=0）才能开始对局。</p>
+              <div class="poolgrid swap">
+                <span v-for="ch in effectivePoolView" :key="'b' + ch"
+                      :class="{ on: poolOn[ch], cut: removedSet.has(ch) }"
+                      :title="removedSet.has(ch) ? '点击恢复该字' : '点击从基础字库移除'"
+                      @click="toggleRemoveChar(ch)">{{ ch }}</span>
+              </div>
+              <div class="swap-head">候选（额外字池 · 按频次取前 300）</div>
+              <div class="poolgrid swap">
+                <span v-for="ch in extraCandidates" :key="'e' + ch" class="cand"
+                      title="点击补入基础字库" @click="toggleAddChar(ch)">{{ ch }}</span>
+              </div>
             </div>
           </details>
           <details>
@@ -1698,6 +1773,11 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .recent{margin-top:16px;border-top:1px dashed var(--line);padding-top:12px;}
 .recent-title{margin:0 0 8px;font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.5px;}
 .row.center{justify-content:center;}
+.swap-head{margin:12px 0 6px;font-size:12px;font-weight:800;color:var(--muted);}
+.poolgrid.swap span{cursor:pointer;user-select:none;transition:.12s;}
+.poolgrid.swap span:hover{transform:scale(1.12);}
+.poolgrid.swap span.cut{opacity:.4;text-decoration:line-through;background:#FBEDEA;border-color:#F0C7C4;}
+.poolgrid.swap span.cand{color:#8A5A0B;background:#FFF9EE;border-color:#EFE0C0;}
 .ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
 .ghost-del:hover{background:#FBEDEA;}
 .recent-row{display:flex;align-items:center;gap:10px;padding:6px 0;}
