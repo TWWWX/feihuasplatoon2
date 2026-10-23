@@ -265,6 +265,11 @@ function onPeerOnline(clientId) {
   if (!clientId || clientId === uid) return
   peersInfo = { ...peersInfo, [clientId]: { online: true, offlineAt: 0 } }
   refreshOnline()
+  /* 对方回来了：清掉离线类提示并告知已恢复 */
+  if (msg.value && /对方(连接已断开|已被移出房间)/.test(msg.value.text)) {
+    clearMsg()
+    flashTip('对方已重新连接。', 'ok')
+  }
 }
 function onPeerOffline(clientId, code) {
   if (!clientId || clientId === uid) return /* 同设备重连的旧连接广播（理论已过滤），防自误离线 */
@@ -691,11 +696,18 @@ const extraOnBoard = computed(() => {
 
 /* ---------- 消息条 ---------- */
 const msg = ref(null) // { text, kind: ok|warn|err }
+let msgTimer = null /* 提示自动消失：5 秒后清除，新提示会重置计时 */
 function flashTip(text, kind = 'ok') {
   msg.value = { text, kind }
+  if (msgTimer) clearTimeout(msgTimer)
+  msgTimer = setTimeout(clearMsg, 5000)
 }
 function clearMsg() {
   msg.value = null
+  if (msgTimer) {
+    clearTimeout(msgTimer)
+    msgTimer = null
+  }
 }
 
 /* ================= 工具函数 ================= */
