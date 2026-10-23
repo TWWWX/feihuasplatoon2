@@ -1523,8 +1523,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                         @click="selectAllPools" title="七个字库全部参与（默认）">全选</button>
               </div>
               <div class="poolgrid swap">
-                <span v-for="ch in activePool" :key="ch"
-                      :class="{ on: poolOn[ch] && !removedChars.has(ch), cut: removedChars.has(ch) }"
+                <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] && !removedChars.has(ch) }"
                       :title="poolOn[ch] ? (removedChars.has(ch) ? '已取消，点击恢复' : '点击取消棋盘上的该字') : '点击用该字补位被取消的棋盘字'"
                       @click="onPoolSwapPick(ch)">{{ ch }}</span>
               </div>
@@ -1752,7 +1751,6 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .row.center{justify-content:center;}
 .poolgrid.swap span{cursor:pointer;user-select:none;transition:.12s;}
 .poolgrid.swap span:hover{transform:scale(1.12);}
-.poolgrid.swap span.cut{opacity:.4;text-decoration:line-through;}
 .cell.cut{opacity:.35;text-decoration:line-through;outline:2px dashed #D98A80;outline-offset:-3px;}
 .ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
 .ghost-del:hover{background:#FBEDEA;}
