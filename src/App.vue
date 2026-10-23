@@ -1,7 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { connectWs, closeWs, sendRaw, sendKick, wsStatus, wsError } from './useWebSocket'
-import { POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
+import { POOL, POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
 import { exportShotPng, exportShotGif } from './game/exporter'
 
 /* ================= 连接状态（WebSocket → GameRoom；变量名沿用旧模板绑定） =================
@@ -757,54 +757,35 @@ const activePool = computed(() => {
   return out
 })
 const activePoolSet = computed(() => new Set(activePool.value))
-/* 生效字库 = 基础字库 − 手动移除 + 手动补入（换字守恒：移除数 == 补入数才能开局） */
+/* 手动换字：点字库字块取消/恢复（poolRemoved）、点未入选字补位（poolAdded）。
+   不重抽棋盘——改动即时进入生效字库，下一次重抽/再来一局才铺新字；
+   守恒约束：补入数 ≤ 移除数，两者相等（含 0=0）才能开局。 */
 const removedSet = computed(() => new Set(Array.from(gameState.poolRemoved)))
 const addedSet = computed(() => new Set(Array.from(gameState.poolAdded)))
 const removedArr = computed(() => Array.from(gameState.poolRemoved))
 const addedArr = computed(() => Array.from(gameState.poolAdded))
-const effectivePoolView = computed(() => {
-  /* 展示用：基础库 + 补入（含已移除的字，标删除线可恢复） */
-  const out = []
-  const seen = new Set()
-  const push = (arr) => {
-    for (const ch of arr) if (!seen.has(ch)) { seen.add(ch); out.push(ch) }
-  }
-  push(activePool.value)
-  push(Array.from(gameState.poolAdded))
+const effectivePool = computed(() => {
+  const rm = removedSet.value
+  const out = activePool.value.filter((ch) => !rm.has(ch))
+  for (const ch of gameState.poolAdded) if (!rm.has(ch)) out.push(ch)
   return out
 })
-const effectivePool = computed(() => {
-  /* 抽盘用：展示列表去掉已移除的字 */
-  const rm = removedSet.value
-  return effectivePoolView.value.filter((ch) => !rm.has(ch))
-})
 const effectivePoolSet = computed(() => new Set(effectivePool.value))
-/* 候选字：额外字池中不在生效字库、也尚未补入的字，按频次降序取前 300 */
-const extraCandidates = computed(() =>
-  EXTRA.filter((ch) => !effectivePoolSet.value.has(ch) && !addedSet.value.has(ch))
-    .sort((a, b) => (EXTRA_FREQ[b] || 0) - (EXTRA_FREQ[a] || 0))
-    .slice(0, 300)
-)
-function toggleRemoveChar(ch) {
+function onPoolCharClick(ch) {
   if (gameState.phase !== 'ready') return
-  gameState.poolRemoved = gameState.poolRemoved.includes(ch)
-    ? gameState.poolRemoved.replace(ch, '')
-    : gameState.poolRemoved + ch
-  redrawBoard()
-  syncState()
-}
-function toggleAddChar(ch) {
-  if (gameState.phase !== 'ready') return
-  if (addedSet.value.has(ch)) {
+  if (removedSet.value.has(ch)) {
+    gameState.poolRemoved = gameState.poolRemoved.replace(ch, '')
+  } else if (addedSet.value.has(ch)) {
     gameState.poolAdded = gameState.poolAdded.replace(ch, '')
+  } else if (activePoolSet.value.has(ch)) {
+    gameState.poolRemoved += ch /* 取消选中：该字退出下一次抽盘 */
   } else {
     if (addedArr.value.length >= removedArr.value.length) {
-      flashTip('补入数不能超过移除数：先在基础字库中移除一个字，再补入。', 'warn')
+      flashTip('需先取消选中一个字，才能选入别的字（两者数量要相等才能开局）。', 'warn')
       return
     }
-    gameState.poolAdded += ch
+    gameState.poolAdded += ch /* 选入别的未被选中的字补位 */
   }
-  redrawBoard()
   syncState()
 }
 const extraAvail = computed(() => EXTRA.reduce((n, ch) => (activePoolSet.value.has(ch) ? n : n + 1), 0))
@@ -876,8 +857,9 @@ const poolOn = computed(() => {
   return m
 })
 const extraOnBoard = computed(() => {
+  /* 不在生效字库、且不是刚被手动移除的基础字（本局仍留在棋盘上）→ 视为额外字 */
   const sel = effectivePoolSet.value
-  const ex = gameState.board.filter((c) => !sel.has(c.ch)).map((c) => c.ch)
+  const ex = gameState.board.filter((c) => !sel.has(c.ch) && !removedSet.value.has(c.ch)).map((c) => c.ch)
   ex.sort((x, y) => (EXTRA_FREQ[y] || 0) - (EXTRA_FREQ[x] || 0))
   return ex
 })
@@ -1535,23 +1517,13 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                 <button class="primary" :disabled="gameState.phase !== 'ready'"
                         @click="selectAllPools" title="七个字库全部参与（默认）">全选</button>
               </div>
-              <div class="poolgrid">
-                <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] }">{{ ch }}</span>
-              </div>
-              <p class="poolnote">勾选的字库集合取并集去重后构成基础字库；对局中不可调整，开局前双方均可切换并自动重抽。</p>
-              <div class="swap-head">手动换字（移除 {{ removedArr.length }} 字 · 补入 {{ addedArr.length }} 字{{ removedArr.length === addedArr.length ? ' · 可开局' : ' · 需相等才能开局' }}）</div>
-              <p class="poolnote">点击下方字块「移除/恢复」；从候选区点击「补入」。补入数不能超过移除数，两者相等（含 0=0）才能开始对局。</p>
               <div class="poolgrid swap">
-                <span v-for="ch in effectivePoolView" :key="'b' + ch"
-                      :class="{ on: poolOn[ch], cut: removedSet.has(ch) }"
-                      :title="removedSet.has(ch) ? '点击恢复该字' : '点击从基础字库移除'"
-                      @click="toggleRemoveChar(ch)">{{ ch }}</span>
+                <span v-for="ch in POOL" :key="ch"
+                      :class="{ on: poolOn[ch], cut: removedSet.has(ch), cand: addedSet.has(ch), off: !activePoolSet.has(ch) && !addedSet.has(ch) }"
+                      :title="removedSet.has(ch) ? '点击恢复该字' : addedSet.has(ch) ? '点击取消选入' : activePoolSet.has(ch) ? '点击取消选中（退出下一次抽盘）' : '点击选入（补位，需先取消选中一个字）'"
+                      @click="onPoolCharClick(ch)">{{ ch }}</span>
               </div>
-              <div class="swap-head">候选（额外字池 · 按频次取前 300）</div>
-              <div class="poolgrid swap">
-                <span v-for="ch in extraCandidates" :key="'e' + ch" class="cand"
-                      title="点击补入基础字库" @click="toggleAddChar(ch)">{{ ch }}</span>
-              </div>
+              <p class="poolnote">选字：点击字块可取消选中 / 再选入补位（数量须相等才能开局）；改动不重抽当前棋盘，下次重抽生效。当前移除 {{ removedArr.length }} 字 · 选入 {{ addedArr.length }} 字{{ removedArr.length === addedArr.length ? ' · 可开局' : ' · 未守恒' }}。</p>
             </div>
           </details>
           <details>
@@ -1773,9 +1745,9 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .recent{margin-top:16px;border-top:1px dashed var(--line);padding-top:12px;}
 .recent-title{margin:0 0 8px;font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.5px;}
 .row.center{justify-content:center;}
-.swap-head{margin:12px 0 6px;font-size:12px;font-weight:800;color:var(--muted);}
 .poolgrid.swap span{cursor:pointer;user-select:none;transition:.12s;}
 .poolgrid.swap span:hover{transform:scale(1.12);}
+.poolgrid.swap span.off{opacity:.45;}
 .poolgrid.swap span.cut{opacity:.4;text-decoration:line-through;background:#FBEDEA;border-color:#F0C7C4;}
 .poolgrid.swap span.cand{color:#8A5A0B;background:#FFF9EE;border-color:#EFE0C0;}
 .ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
