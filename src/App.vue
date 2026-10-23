@@ -264,19 +264,12 @@ function onPeers(list) {
 function onPeerOnline(clientId) {
   if (!clientId || clientId === uid) return
   peersInfo = { ...peersInfo, [clientId]: { online: true, offlineAt: 0 } }
-  refreshOnline()
-  /* 对方回来了：清掉离线类提示并告知已恢复 */
-  if (msg.value && /对方(连接已断开|已被移出房间)/.test(msg.value.text)) {
-    clearMsg()
-    flashTip('对方已重新连接。', 'ok')
-  }
+  refreshOnline() /* 仅恢复徽标显示，不弹提示 */
 }
 function onPeerOffline(clientId, code) {
   if (!clientId || clientId === uid) return /* 同设备重连的旧连接广播（理论已过滤），防自误离线 */
   peersInfo = { ...peersInfo, [clientId]: { online: false, offlineAt: Date.now() } }
-  refreshOnline()
-  if (code === 4001) flashTip('对方已被移出房间。', 'warn')
-  else flashTip('对方连接已断开。', 'warn')
+  refreshOnline() /* 仅显示离线徽标，不弹提示 */
 }
 /* 由 peersInfo 推导红青两营在线徽标 + 安排「离线满 1 分钟」的踢出按钮 */
 function refreshOnline() {
