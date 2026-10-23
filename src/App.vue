@@ -298,24 +298,6 @@ const hasLocalSave = ref(false)
 const localNameA = ref('')
 const localNameB = ref('')
 let localSaveTimer = null
-function persistLocalGame() {
-  if (!isLocalMode.value) return
-  try {
-    localStorage.setItem(LOCAL_KEY, JSON.stringify({ gameState, players: players.value, at: Date.now() }))
-    hasLocalSave.value = true
-  } catch {}
-}
-/* 主持台状态自动保存：落子/撤销/修正/开局结算等一切 gameState 变更（深比较 + 300ms 防抖） */
-watch(
-  gameState,
-  () => {
-    if (!isLocalMode.value) return
-    if (localSaveTimer) clearTimeout(localSaveTimer)
-    localSaveTimer = setTimeout(persistLocalGame, 300)
-  },
-  { deep: true }
-)
-watch(players, persistLocalGame) /* 本地改名即时保存 */
 function startLocalGame() {
   isLocalMode.value = true
   let restored = false
@@ -712,6 +694,26 @@ const extraInput = ref(0)
 const fixMode = ref(false)
 const allowDup = ref(false)
 const keepPunct = ref(false)
+
+/* 主持台状态自动保存：必须在 gameState/sizeInput 声明之后（setup 顶层同步 watch，放前面会 TDZ）
+   落子/撤销/修正/开局结算等一切 gameState 变更（深比较 + 300ms 防抖）写 localStorage */
+function persistLocalGame() {
+  if (!isLocalMode.value) return
+  try {
+    localStorage.setItem(LOCAL_KEY, JSON.stringify({ gameState, players: players.value, at: Date.now() }))
+    hasLocalSave.value = true
+  } catch {}
+}
+watch(
+  gameState,
+  () => {
+    if (!isLocalMode.value) return
+    if (localSaveTimer) clearTimeout(localSaveTimer)
+    localSaveTimer = setTimeout(persistLocalGame, 300)
+  },
+  { deep: true }
+)
+watch(players, persistLocalGame) /* 本地改名即时保存 */
 
 /* ---------- 字库集合选择（开局前，房主设置，随 state.poolMask 同步双方） ---------- */
 const POOL_OPTIONS = [
