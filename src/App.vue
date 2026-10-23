@@ -19,7 +19,14 @@ const uid = (() => {
   return v
 })()
 const connText = computed(
-  () => ({ connecting: '连接中…', ok: '已连接服务器', lost: '连接断开，重连中…', error: fbError.value || '连接失败' }[fbStatus.value])
+  () =>
+    ({
+      idle: '',
+      connecting: '连接中…',
+      ok: '已连接服务器',
+      lost: '连接断开，重连中…',
+      error: fbError.value || '连接失败',
+    }[fbStatus.value])
 )
 const lobbyStatusText = computed(
   () =>
@@ -28,7 +35,7 @@ const lobbyStatusText = computed(
       ok: '已连接服务器，等待创建房间',
       lost: '连接断开，正在重连…',
       error: '连接失败：' + fbError.value,
-    }[fbStatus.value])
+    }[fbStatus.value] || '')
 )
 
 /* ================= 房间联机（WS 全量快照，方案 B） =================
@@ -1205,7 +1212,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
       <div class="card">
         <div class="pad">
           <p class="sec-title">联机对战</p>
-          <div class="lobby-status" :class="fbStatus">{{ lobbyStatusText }}</div>
+          <div v-if="lobbyStatusText" class="lobby-status" :class="fbStatus">{{ lobbyStatusText }}</div>
           <div v-if="lobbyMsg" class="msg" :class="lobbyMsg.kind">{{ lobbyMsg.text }}</div>
           <button class="primary big" :disabled="roomBusy || !uid" @click="createRoom">创建房间</button>
           <div class="row joinrow">

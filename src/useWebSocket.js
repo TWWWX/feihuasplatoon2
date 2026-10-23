@@ -9,7 +9,7 @@
      重连成功后 DO 会回放最近保存的 state，前端 applyRoomSnapshot 直接覆盖，无需增量协议。 */
 import { ref } from 'vue'
 
-export const wsStatus = ref('connecting') // connecting | ok | lost | error
+export const wsStatus = ref('idle') // idle(未发起连接) | connecting | ok | lost | error
 export const wsError = ref('')
 
 let ws = null
@@ -134,5 +134,5 @@ export function closeWs() {
     } catch {}
     ws = null
   }
-  wsStatus.value = 'connecting'
+  wsStatus.value = 'idle'
 }
