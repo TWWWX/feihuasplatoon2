@@ -64,6 +64,15 @@ export function connectWs(code, h) {
   doConnect()
 }
 function doConnect() {
+  /* 安全复用：上一次连接仍在（重复 connectWs）→ 先静默关闭，防止同页双连接泄漏 */
+  if (ws) {
+    const old = ws
+    old.onclose = null
+    old.onerror = null
+    try {
+      old.close()
+    } catch {}
+  }
   wsStatus.value = 'connecting'
   try {
     ws = new WebSocket(wsUrl(roomId))
@@ -105,8 +114,9 @@ function doConnect() {
     if (handlers.onMessage) handlers.onMessage(data)
   }
   ws.onclose = (ev) => {
-    /* 4001：被踢出 / 连接数超限；4000：席位被顶替 → 交由上层决定，不自动重连 */
-    if (ev.code === 4001 || ev.code === 4000) {
+    /* 4001：被踢出 / 连接数超限；4000：席位被顶替；4002：同一设备重新连接（旧连接被顶替）
+       → 交由上层决定，不自动重连（否则旧页面会与新页面互相重连打环） */
+    if (ev.code === 4001 || ev.code === 4000 || ev.code === 4002) {
       wsStatus.value = 'error'
       wsError.value = ev.reason || '连接被服务器关闭'
       if (handlers.onRejected) handlers.onRejected(ev.code, ev.reason)

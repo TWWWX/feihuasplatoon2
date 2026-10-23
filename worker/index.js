@@ -13,7 +13,8 @@
      peers 快照判定（ensureSeat），被顶替者由前端 sendKick 精确关闭（DO 不解析席位归属）
    - 房间回收：state 超 24 小时未更新（双方均离线超过 24h）→ 清空 storage + D1，房间视为不存在
    持久化说明：storage.put 为权威副本（hibernate 唤醒用）；D1 rooms 表为备份/审计，恢复时仅作回退。 */
-const MAX_CONNECTIONS = 3 /* 硬上限（两名玩家 + 顶替中连接），防滥用 */
+const MAX_CONNECTIONS = 6 /* 防滥用上限（正常 2 名玩家 + 刷新/重连窗口的残留连接）；同 clientId 顶替在 __hello 时清理 */
+const RECONNECT_CODE = 4002 /* 同设备重新连接：关闭旧连接用，不广播 peer_offline（人还在线） */
 const ROOM_TTL = 24 * 60 * 60 * 1000 /* state 超过 24h 未更新 → 房间回收 */
 
 export class GameRoom {
@@ -100,13 +101,23 @@ export class GameRoom {
         await this.ensureOfflineLog()
         this.offlineLog.delete(meta.clientId) /* 回归者清掉离线记录 */
         persistOfflineLog(this)
-        /* 初始成员快照（替代旧 __who 轮询）：在线者 = 池内其他连接；离线者 = offlineLog */
+        /* 同 clientId 顶替：页面刷新/断线重连时旧连接可能仍留在池里（close 处理滞后），
+           直接关闭旧连接（不广播离线——人还在线），防止死连接堵住连接数上限 */
+        for (const s of this.state.getWebSockets()) {
+          if (s !== ws && (readMeta(s) || {}).clientId === meta.clientId) {
+            try {
+              s.close(RECONNECT_CODE, '同一设备已重新连接')
+            } catch {}
+          }
+        }
+        /* 初始成员快照（替代旧 __who 轮询）：在线者 = 池内其他连接（排除同 clientId 残留）；
+           离线者 = offlineLog */
         const onlineIds = new Set()
         const list = []
         for (const s of this.state.getWebSockets()) {
           if (s === ws) continue
           const m = readMeta(s) || {}
-          if (m.clientId) {
+          if (m.clientId && m.clientId !== meta.clientId) {
             onlineIds.add(m.clientId)
             list.push({ clientId: m.clientId, online: true })
           }
@@ -153,6 +164,8 @@ export class GameRoom {
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
+    /* 同设备重连关闭（RECONNECT_CODE）：人还在线，不记离线、不广播 */
+    if (code === RECONNECT_CODE) return
     /* 记录离线时间（双离线顶替时比较「谁离线更久」用）并广播对端离线 */
     const meta = readMeta(ws) || {}
     if (meta.clientId) {

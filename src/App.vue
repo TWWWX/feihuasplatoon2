@@ -262,12 +262,12 @@ function onPeers(list) {
   ensureSeat() /* 无席兜底：快照到齐即补坐 */
 }
 function onPeerOnline(clientId) {
-  if (!clientId) return
+  if (!clientId || clientId === uid) return
   peersInfo = { ...peersInfo, [clientId]: { online: true, offlineAt: 0 } }
   refreshOnline()
 }
 function onPeerOffline(clientId, code) {
-  if (!clientId) return
+  if (!clientId || clientId === uid) return /* 同设备重连的旧连接广播（理论已过滤），防自误离线 */
   peersInfo = { ...peersInfo, [clientId]: { online: false, offlineAt: Date.now() } }
   refreshOnline()
   if (code === 4001) flashTip('对方已被移出房间。', 'warn')
@@ -454,8 +454,11 @@ function loadRecentRooms() {
   }
 }
 function rememberRoom(code, asHost) {
+  /* host 是「我是创建者」的事实标记：刷新/回连（joinRoom 路径）不覆盖已有 host=true */
+  const prev = loadRecentRooms().find((r) => r.code === code)
+  const host = !!asHost || !!(prev && prev.host)
   const list = loadRecentRooms().filter((r) => r.code !== code)
-  list.unshift({ code, at: Date.now(), host: !!asHost })
+  list.unshift({ code, at: Date.now(), host })
   localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 5)))
   recentRooms.value = loadRecentRooms()
 }
