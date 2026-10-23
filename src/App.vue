@@ -853,8 +853,10 @@ function poemSegs(e) {
 }
 
 /* ================= 核心判定：飞花 ================= */
+let submitting = false /* 防重入：await 换繁转简期间连点/连按回车会双提交（第二次校验时格子已涂色 → 误报违反规则 3） */
 async function submitLine() {
   if (gameState.phase !== 'playing') return
+  if (submitting) return
   if (!myTurn.value) {
     flashTip(myTeam.value === null ? '观战身份不能出牌。' : '还没轮到你出牌，请等待对方。', 'err')
     return
@@ -866,70 +868,75 @@ async function submitLine() {
     flashTip('请先输入诗句（仅中文汉字会被识别）。', 'err')
     return
   }
-  /* 转简体：棋盘与历史记录都是简体口径，匹配/查重统一用它 */
-  const norm = await toSimplified(chars)
-  const set = {}
-  for (const ch of norm) set[ch] = true
+  submitting = true
+  try {
+    /* 转简体：棋盘与历史记录都是简体口径，匹配/查重统一用它 */
+    const norm = await toSimplified(chars)
+    const set = {}
+    for (const ch of norm) set[ch] = true
 
-  const hits = [], blanks = [], captures = [], holds = []
-  const me = currentTeam.value
-  const other = me === 'A' ? 'B' : 'A'
-  gameState.board.forEach((cell, idx) => {
-    if (set[cell.ch]) {
-      hits.push(idx)
-      if (!cell.owner) blanks.push(idx)
-      else if (cell.owner === other) captures.push(idx)
-      else holds.push(idx)
-    }
-  })
+    const hits = [], blanks = [], captures = [], holds = []
+    const me = currentTeam.value
+    const other = me === 'A' ? 'B' : 'A'
+    gameState.board.forEach((cell, idx) => {
+      if (set[cell.ch]) {
+        hits.push(idx)
+        if (!cell.owner) blanks.push(idx)
+        else if (cell.owner === other) captures.push(idx)
+        else holds.push(idx)
+      }
+    })
 
-  if (!hits.length) {
-    flashTip('✕ 无命中：这句里没有出现棋盘上的任何字，本句无效，请换一句。', 'err')
-    return
-  }
-  if (!blanks.length) {
-    flashTip(`✕ 违反规则 3：本句命中的 ${hits.length} 个格子全部已有颜色，没有使用任何一个未填色格，本句无效。`, 'err')
-    return
-  }
-  if (!allowDup.value) {
-    const dup = gameState.log.some((e) => e.type === 'fly' && e.norm === norm)
-    if (dup) {
-      flashTip('✕ 重复句：这句已经飞过了。如需放行，请勾选「允许重复句」。', 'err')
+    if (!hits.length) {
+      flashTip('✕ 无命中：这句里没有出现棋盘上的任何字，本句无效，请换一句。', 'err')
       return
     }
-  }
-
-  /* 记录快照，供撤销 */
-  gameState.undoStack.push({
-    board: gameState.board.map((c) => ({ ch: c.ch, owner: c.owner })),
-    logLen: gameState.log.length,
-    turnNo: gameState.turnNo,
-  })
-
-  /* 涂色：只改响应式数据，视图自动更新；同时记下本手变化的格子供白描边 */
-  const changed = {}
-  hits.forEach((idx) => {
-    if (gameState.board[idx].owner !== me) {
-      gameState.board[idx].owner = me
-      changed[idx] = 1
+    if (!blanks.length) {
+      flashTip(`✕ 违反规则 3：本句命中的 ${hits.length} 个格子全部已有颜色，没有使用任何一个未填色格，本句无效。`, 'err')
+      return
     }
-  })
+    if (!allowDup.value) {
+      const dup = gameState.log.some((e) => e.type === 'fly' && e.norm === norm)
+      if (dup) {
+        flashTip('✕ 重复句：这句已经飞过了。如需放行，请勾选「允许重复句」。', 'err')
+        return
+      }
+    }
 
-  gameState.log.push({
-    type: 'fly', team: me, round: currentRound.value, line: norm, norm,
-    hits: hits.length, blank: blanks.length, capture: captures.length, hold: holds.length,
-    raw: (raw || '').trim(), cells: hits.slice(),
-  })
+    /* 记录快照，供撤销 */
+    gameState.undoStack.push({
+      board: gameState.board.map((c) => ({ ch: c.ch, owner: c.owner })),
+      logLen: gameState.log.length,
+      turnNo: gameState.turnNo,
+    })
 
-  previewSet.value = new Set()
-  markChanged(changed)
-  flashTip(
-    `✓ ${teamNames.value[me]} 飞花成功：命中 ${hits.length} 格 → 新占 ${blanks.length} · 抢夺 ${captures.length} · 己方 ${holds.length}。` +
-      (captures.length ? `（从对方手中抢下 ${captures.length} 格 🔥）` : ''),
-    'ok'
-  )
-  advance()
-  syncState()
+    /* 涂色：只改响应式数据，视图自动更新；同时记下本手变化的格子供白描边 */
+    const changed = {}
+    hits.forEach((idx) => {
+      if (gameState.board[idx].owner !== me) {
+        gameState.board[idx].owner = me
+        changed[idx] = 1
+      }
+    })
+
+    gameState.log.push({
+      type: 'fly', team: me, round: currentRound.value, line: norm, norm,
+      hits: hits.length, blank: blanks.length, capture: captures.length, hold: holds.length,
+      raw: (raw || '').trim(), cells: hits.slice(),
+    })
+
+    previewSet.value = new Set()
+    markChanged(changed)
+    flashTip(
+      `✓ ${teamNames.value[me]} 飞花成功：命中 ${hits.length} 格 → 新占 ${blanks.length} · 抢夺 ${captures.length} · 己方 ${holds.length}。` +
+        (captures.length ? `（从对方手中抢下 ${captures.length} 格 🔥）` : ''),
+      'ok'
+    )
+    advance()
+    syncState()
+  } finally {
+    submitting = false
+  }
 }
 
 function advance() {
@@ -1122,6 +1129,7 @@ function onPoemInput() {
 }
 function onPoemKeydown(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.isComposing || e.keyCode === 229) return /* 中文输入法选字回车：不提交，仅上屏候选词 */
     e.preventDefault()
     submitLine()
   }
