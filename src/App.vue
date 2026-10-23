@@ -1220,9 +1220,8 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
       <h1>飞花斯普拉遁</h1>
       <div class="head-tools">
         <span class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
-        <span style="color:#98a4b3;font-size:12px;margin-left:6px;font-weight:600">v2.4</span>
+        <span style="color:#98a4b3;font-size:12px;margin-left:6px;font-weight:600">v3.1</span>
         <span v-if="roomState === 'playing'" class="conn room">房间 {{ roomCode }}</span>
-        <span v-if="roomState === 'playing'" class="conn room">你是{{ myTeam ? teamNames[myTeam] : '入席中…' }}</span>
         <template v-if="roomState === 'playing'">
           <label class="chk" title="开启后，点击棋盘格子可循环切换：无主 → 赤 → 青 → 无主">
             <input type="checkbox" v-model="fixMode" /> 修正模式
