@@ -1,34 +1,43 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { ensureAuth, rtdbGet, rtdbSet, rtdbPatch, rtdbRemove } from './api'
+import { connectWs, closeWs, sendRaw, sendKick, wsStatus, wsError } from './useWebSocket'
 import { POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
 import { exportShotPng, exportShotGif } from './game/exporter'
 
-/* ================= Firebase 连接状态（仅连接指示，游戏数据同步后续阶段接入） ================= */
-const fbStatus = ref('connecting') // connecting | ok | lost | error
-const fbError = ref('')
-const uid = ref('')
+/* ================= 连接状态（WebSocket → GameRoom；变量名沿用旧模板绑定） =================
+   身份：localStorage 持久化的 clientId 替代 Firebase uid。建房者=赤营、加入者=青营，
+   席位/房主/阵营名随 state 一起走 WS 全量同步（方案 B：纯转发器，DO 不解析业务）。 */
+const fbStatus = wsStatus
+const fbError = wsError
+const CLIENT_KEY = 'fh_client_id'
+const uid = (() => {
+  let v = localStorage.getItem(CLIENT_KEY)
+  if (!v) {
+    v = (crypto.randomUUID && crypto.randomUUID()) || 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+    localStorage.setItem(CLIENT_KEY, v)
+  }
+  return v
+})()
 const connText = computed(
-  () => ({ connecting: '连接中…', ok: '已连接 Firebase', lost: '连接断开', error: '连接失败' }[fbStatus.value])
+  () => ({ connecting: '连接中…', ok: '已连接服务器', lost: '连接断开，重连中…', error: fbError.value || '连接失败' }[fbStatus.value])
 )
 const lobbyStatusText = computed(
   () =>
     ({
-      connecting: '正在连接 Firebase…',
-      ok: '已连接 Firebase，等待创建房间',
+      connecting: '正在连接服务器…',
+      ok: '已连接服务器，等待创建房间',
       lost: '连接断开，正在重连…',
       error: '连接失败：' + fbError.value,
     }[fbStatus.value])
 )
 
-/* ================= 房间联机（Firebase Realtime Database） =================
-   rooms/{roomId} = {
-     meta:   { hostUid, createdAt },
-     players:{ red: { uid, name }, blue: { uid, name } },
-     state:  { seed, side, totalRounds, endless, poolMask, board, currentTurn,
-               round, redScore, blueScore, history, status, endReason }
-   }
-   本地用 A/B 表示赤/青，与云端 red/blue 在同步边界互转。 */
+/* ================= 房间联机（WS 全量快照，方案 B） =================
+   WS 消息即云端 state（原 rooms/{roomId}/state 字段）+ 附加 meta/players：
+     { seed, side, poolMask, board, currentTurn, round, redScore, blueScore,
+       history, status, endReason,
+       meta:    { hostId },                                   // 原 hostUid → clientId
+       players: { red: { clientId, name } | null, blue: … } } // 原 uid → clientId
+   本地仍用 A/B 表示赤/青，与线上 red/blue 在同步边界互转。 */
 const roomState = ref('lobby') // lobby | playing
 const joinCode = ref('')
 const roomCode = ref('')
@@ -38,17 +47,17 @@ const players = ref({})
 const roomMeta = ref(null)
 const myTeam = computed(() => {
   const p = players.value || {}
-  if (p.red?.uid === uid.value) return 'A'
-  if (p.blue?.uid === uid.value) return 'B'
+  if (p.red?.clientId === uid) return 'A'
+  if (p.blue?.clientId === uid) return 'B'
   return null
 })
-/* 在线心跳：各席位成员写 presence/red | presence/blue（REST 无 onDisconnect，用时间戳判定）。
-   对方离线只做「标记」，不暂停对战：对方离线时仍可正常提交（云端不依赖对方在线）。 */
+/* 在线状态：来自 DO 的 __who（clientId + lastSeen），由 useWebSocket 每 15s 轮询。
+   对方离线只做「标记」，不暂停对战：对方离线时仍可正常提交（同步不依赖对方在线）。 */
 const redOnline = ref(true)
 const blueOnline = ref(true)
 const peerKickable = ref(false) /* 对方离线满 3 分钟：徽标变踢出按钮 */
 const gotRoomSnapshot = ref(false)
-/* 对方席位离线（超 25 秒无心跳）：显示横幅与徽标；满 3 分钟徽标变踢出按钮，也可被新成员顶替 */
+/* 对方席位离线（90 秒无 pong）：显示横幅与徽标；满 3 分钟徽标变踢出按钮，也可被新成员顶替 */
 const peerOffline = computed(
   () =>
     roomState.value === 'playing' &&
@@ -56,17 +65,16 @@ const peerOffline = computed(
     gotRoomSnapshot.value &&
     !(myTeam.value === 'A' ? blueOnline.value : redOnline.value)
 )
-async function kickPeer() {
+function kickPeer() {
   if (!roomCode.value || !myTeam.value) return
   const seat = myTeam.value === 'A' ? 'blue' : 'red'
+  const p = players.value || {}
+  const target = p[seat] && p[seat].clientId
   if (!confirm(`将「${teamNames.value[myTeam.value === 'A' ? 'B' : 'A']}」移出房间？对方会立刻回到大厅，席位空出后新人可加入（需对方离线超过 3 分钟）。`)) return
-  try {
-    await rtdbRemove(`rooms/${roomCode.value}/players/${seat}`)
-    flashTip('对方席位已空出。', 'ok')
-  } catch (e) {
-    const msg = String((e && e.message) || e)
-    flashTip(/permission denied/i.test(msg) ? '移出被拒：对方离线未满 3 分钟（安全规则限制）。' : '移出失败：' + msg, 'err')
-  }
+  if (target) sendKick(target) /* 瞬时踢人：DO 直接 close 对方 ws（若仍连着） */
+  players.value = { ...p, [seat]: null }
+  syncState()
+  flashTip('对方席位已空出。', 'ok')
 }
 /* 回合锁：只有轮到自己阵营时才能出牌（观战身份不能出牌） */
 const myTurn = computed(() => myTeam.value !== null && currentTeam.value === myTeam.value)
@@ -155,6 +163,12 @@ function localToCloudState() {
     history: gameState.log.map((e) => ({ ...e, team: e.team === 'A' ? 'red' : 'blue' })),
     status: gameState.phase,
     endReason: finishReason.value || null,
+    /* 方案 B：房间管理信息（房主/席位/阵营名）随 state 一起全量同步 */
+    meta: { hostId: (roomMeta.value && roomMeta.value.hostId) || '' },
+    players: {
+      red: players.value.red ? { clientId: players.value.red.clientId, name: players.value.red.name } : null,
+      blue: players.value.blue ? { clientId: players.value.blue.clientId, name: players.value.blue.name } : null,
+    },
   }
 }
 function cloudToLocalState(st) {
@@ -175,101 +189,20 @@ function cloudToLocalState(st) {
   }
 }
 
-/* ---- 轮询同步（REST 无长连接：3s 拉整房，内容有变化才写回本地；页面隐藏时暂停） ---- */
-let pollTimer = null
-let lastRoomJson = ''
-let lastBeatAt = 0 /* 上次心跳写入时刻：15 秒一写，省 Function 调用额度 */
-
-async function pollOnce(code) {
-    let val = null
-    try {
-      val = await rtdbGet(`rooms/${code}`)
-      if (fbStatus.value !== 'ok') fbStatus.value = 'ok'
-    } catch (e) {
-      /* 被房主移出后 read 规则失效（permission denied / 401）→ 判定被踢，回大厅 */
-      if (/permission denied|401|403/i.test(String((e && e.message) || e))) {
-        stopPolling()
-        exitRoom('kicked')
-        return
-      }
-      fbStatus.value = 'lost'
-      return
-    }
-    if (!val) {
-      /* 房间被房主解散（rooms/{code} 不存在）→ 回大厅 */
-      stopPolling()
-      exitRoom('dismissed')
-      return
-    }
-    /* 席位心跳：各席位成员写 presence/red | presence/blue（REST 无 onDisconnect，时间戳判定）。
-       必须用 PUT（RTDB REST 的 PATCH 只接受 {路径:值} 对象，裸数字会 400） */
-    const seats = val.players || {}
-    const mySeat = seats.red && seats.red.uid === uid.value ? 'red' : seats.blue && seats.blue.uid === uid.value ? 'blue' : null
-    if (mySeat && Date.now() - lastBeatAt >= 15000) {
-      lastBeatAt = Date.now()
-      rtdbSet(`rooms/${code}/presence/${mySeat}`, Date.now()).catch(() => {})
-    }
-    /* 离线判定：席位为空或心跳 25 秒内更新视为在线（心跳 15s + 轮询 3s 抖动余量）；离线满 3 分钟可踢出/顶替 */
-    const now = Date.now()
-    const freshTs = (t) => typeof t === 'number' && now - t < 25000
-    redOnline.value = !seats.red || seats.red.uid === uid.value || freshTs(val.presence && val.presence.red)
-    blueOnline.value = !seats.blue || seats.blue.uid === uid.value || freshTs(val.presence && val.presence.blue)
-    peerKickable.value =
-      !!myTeam.value &&
-      !!gotRoomSnapshot.value &&
-      ((myTeam.value === 'A' &&
-        !!seats.blue &&
-        seats.blue.uid !== uid.value &&
-        (!(val.presence && typeof val.presence.blue === 'number') || now - val.presence.blue > 180000)) ||
-        (myTeam.value === 'B' &&
-          !!seats.red &&
-          seats.red.uid !== uid.value &&
-          (!(val.presence && typeof val.presence.red === 'number') || now - val.presence.red > 180000)))
-    maintainRoom(val)
-    /* presence 变化不触发界面刷新，只比对 meta/players/state */
-    const json = JSON.stringify([val.meta, val.players, val.state])
-    if (json === lastRoomJson) return
-    lastRoomJson = json
-    applyRoomSnapshot(val)
-}
-function startPollTimer(code) {
-  stopPollTimer()
-  pollTimer = setInterval(() => { pollOnce(code) }, 3000)
-}
-function stopPollTimer() {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
-}
-function startPolling(code) {
-  stopPolling()
-  lastRoomJson = ''
-  lastBeatAt = 0 /* 进房立即写一次心跳，让对手马上看到自己在线 */
-  pollOnce(code) /* 启动即拉一次，不等首个间隔 */
-  startPollTimer(code)
-}
-function stopPolling() {
-  stopPollTimer()
-  lastRoomJson = ''
-}
-/* 页面隐藏时暂停轮询（省 Function 额度），恢复可见立即拉一次并重启定时器 */
-function onVisibilityChange() {
-  const code = roomCode.value
-  if (!code) return
-  if (document.hidden) {
-    stopPollTimer()
-  } else {
-    pollOnce(code).catch(() => {})
-    startPollTimer(code)
-  }
-}
-function applyRoomSnapshot(val) {
-  roomMeta.value = val.meta || null
-  players.value = val.players || {}
+/* ---- 旧 3s 轮询 / 心跳 / JSON 比对层已整体删除：连接、推送、断线重连由 src/useWebSocket.js 负责 ---- */
+/* ---- 应用对端/服务端快照：消息即 state（顶层含 meta/players），直接覆盖本地 ---- */
+let iHadSeat = false /* 我曾占席：快照中席位丢失 → 判定被移出（瞬时踢人兜底） */
+function applyRoomSnapshot(st) {
+  if (!st || typeof st !== 'object') return
+  if (st.meta) roomMeta.value = st.meta
+  if (st.players) players.value = st.players
   gotRoomSnapshot.value = true
-  const st = val.state
-  if (!st) return
+  /* 被移出判定：我曾占席，且当前两个席位都没有我的 clientId */
+  if (iHadSeat && !seatOf(uid)) {
+    exitRoom('kicked')
+    return
+  }
+  if (seatOf(uid)) iHadSeat = true
   const local = cloudToLocalState(st)
   finishReason.value = st.endReason || ''
   gameState.seed = local.seed
@@ -281,94 +214,119 @@ function applyRoomSnapshot(val) {
   gameState.turnNo = local.turnNo
   gameState.log = local.log
   gameState.phase = local.phase
+  maybeDecideSeat()
 }
 
-/* ---- 把本地最新状态整体推到云端（提交/放弃/撤销/结算/开局/重抽共用） ---- */
+/* ---- 把本地最新状态整体推给 DO（提交/放弃/撤销/结算/开局/重抽/改名/占席共用） ----
+   方案 B：消息即整份 state，DO 原样广播给对方并异步持久化（storage + D1） */
 function syncState() {
   if (!roomCode.value) return
-  rtdbSet(`rooms/${roomCode.value}/state`, localToCloudState()).catch((err) =>
-    flashTip('同步失败：' + err.message, 'err')
-  )
+  sendRaw(JSON.stringify(localToCloudState()))
 }
 
-/* ---- 房间维护（轮询时由在线方执行）：无主房间接管 / 房主离线 3 分钟转移（与踢出/顶替阈值一致）。
+/* ---- 在线状态与房主接管（由 DO __who 驱动，useWebSocket 每 15s 拉一次） ----
    席位不再自动移除——离线满 3 分钟由新成员加入时顶替，或在席玩家手动踢出 ---- */
-let lastMaintainAt = 0
-async function maintainRoom(val) {
-  if (!val || !val.meta || !roomCode.value) return
-  if (Date.now() - lastMaintainAt < 30000) return
-  const seats = val.players || {}
-  const red = seats.red && seats.red.uid
-  const blue = seats.blue && seats.blue.uid
-  const mine = uid.value
-  const hostUid = val.meta.hostUid
-  if (!mine || (red !== mine && blue !== mine)) return
-  const fresh3 = (t) => typeof t === 'number' && Date.now() - t < 180000
-  const redHere = !!red && (red === mine || fresh3(val.presence && val.presence.red))
-  const blueHere = !!blue && (blue === mine || fresh3(val.presence && val.presence.blue))
-  const hostSeatGone = hostUid !== red && hostUid !== blue
-  const hostSeatStale = (hostUid === red && !redHere) || (hostUid === blue && !blueHere)
-  /* 房主缺席（席位被顶替/踢出后残留 / 房主离线超 3 分钟）→ 我作为在席成员接管 */
-  if (hostUid !== mine && (hostSeatGone || hostSeatStale)) {
-    try {
-      await rtdbPatch(`rooms/${roomCode.value}/meta`, { hostUid: mine })
-      lastMaintainAt = Date.now()
-      flashTip(hostSeatGone ? '房间无主，你已成为房主。' : '房主离线超过 3 分钟，你已接管房间。', 'ok')
-    } catch (e) {
-      lastMaintainAt = Date.now() /* 失败冷却 30s，避免每秒重试 */
-      console.error('[maintain]', e && e.message)
-    }
+let lastPeers = []
+let lastTakeoverAt = 0
+function seatOf(cid) {
+  const p = players.value || {}
+  if (p.red && p.red.clientId === cid) return 'red'
+  if (p.blue && p.blue.clientId === cid) return 'blue'
+  return null
+}
+function onWho(peers, at) {
+  lastPeers = peers || []
+  const now = at || Date.now()
+  const lastSeen = (cid) => {
+    const peer = lastPeers.find((x) => x.clientId === cid)
+    return peer ? peer.lastSeen || 0 : 0 /* 不在连接池 = 已彻底离线，视为最久 */
+  }
+  const fresh = (cid) => now - lastSeen(cid) < 90000 /* __ping 60s + 抖动余量 */
+  const p = players.value || {}
+  redOnline.value = !p.red || p.red.clientId === uid || fresh(p.red.clientId)
+  blueOnline.value = !p.blue || p.blue.clientId === uid || fresh(p.blue.clientId)
+  const otherSeat = myTeam.value === 'A' ? 'blue' : myTeam.value === 'B' ? 'red' : null
+  peerKickable.value =
+    !!otherSeat && !!gotRoomSnapshot.value && !!p[otherSeat] && now - lastSeen(p[otherSeat].clientId) > 180000
+  maybeTakeover(now)
+}
+/* 房主接管：hostId 不是我，且房主已不在席位（被顶替/踢出后残留）或离线超 3 分钟 → 我接管 */
+function maybeTakeover(now) {
+  const host = roomMeta.value && roomMeta.value.hostId
+  if (!host || host === uid || !myTeam.value || !roomCode.value) return
+  if (now - lastTakeoverAt < 30000) return
+  const hostInSeat = !!seatOf(host)
+  const hostLive = lastPeers.some((x) => x.clientId === host && now - (x.lastSeen || 0) < 180000)
+  if (!hostInSeat || !hostLive) {
+    roomMeta.value = { ...roomMeta.value, hostId: uid }
+    syncState()
+    lastTakeoverAt = Date.now()
+    flashTip(hostInSeat ? '房主离线超过 3 分钟，你已接管房间。' : '房间无主，你已成为房主。', 'ok')
   }
 }
 
 /* ---- 单人房间切换阵营（赤 ⇄ 青）：先占对方空席，再释放自己原席 ---- */
-async function switchSide() {
+function switchSide() {
   if (!roomCode.value || !myTeam.value) return
   const toSeat = myTeam.value === 'A' ? 'blue' : 'red'
   const fromSeat = myTeam.value === 'A' ? 'red' : 'blue'
-  try {
-    await rtdbPatch(`rooms/${roomCode.value}/players/${toSeat}`, {
-      uid: uid.value,
-      name: toSeat === 'red' ? '赤营' : '青营',
-    })
-    await rtdbRemove(`rooms/${roomCode.value}/players/${fromSeat}`)
-    flashTip(`已切换到${toSeat === 'red' ? '赤营' : '青营'}席位。`, 'ok')
-  } catch (e) {
-    flashTip('切换失败：' + (e && e.message), 'err')
+  players.value = {
+    ...players.value,
+    [toSeat]: { clientId: uid, name: toSeat === 'red' ? '赤营' : '青营' },
+    [fromSeat]: null,
   }
+  syncState()
+  flashTip(`已切换到${toSeat === 'red' ? '赤营' : '青营'}席位。`, 'ok')
 }
 const canSwitchSide = computed(() => {
   const p = players.value || {}
-  const mine = uid.value
-  if (!myTeam.value || !mine) return false
+  if (!myTeam.value || !uid) return false
   const other = myTeam.value === 'A' ? p.blue : p.red
-  return !other || !other.uid /* 对方席为空：房间只有我一个 */
+  return !other || !other.clientId /* 对方席为空：房间只有我一个 */
 })
 
+let pendingCreate = false /* 建房者标记：WS 连接建立后立即推送初始 state */
+let joinPending = null /* 加入中：{ code, decided }，快照 + __who 到齐后选席 */
 function enterRoom(code, asHost) {
   roomCode.value = code
   sessionStorage.setItem('fh_room', code)
   rememberRoom(code, asHost)
   roomState.value = 'playing'
-  startPolling(code)
+  connectWs(code, {
+    clientId: uid,
+    onOpen: onWsOpen,
+    onMessage: (st) => applyRoomSnapshot(st),
+    onWho: onWho,
+    onPeerClosed: onPeerClosed,
+    onRejected: onWsRejected,
+  })
 }
-/* 退出房间：青营删除自己的席位节点（空位可让新人加入）；房主删除整个房间（解散）。
-   reason: 'kicked' 被房主移出 | 'dismissed' 房主解散 | 其余为主动退出 */
-async function exitRoom(reason) {
-  stopPolling()
-  const code = roomCode.value
-  if (code && !reason) {
-    if (roomMeta.value?.hostUid === uid.value) {
-      rtdbRemove(`rooms/${code}`).catch(() => {})
-    } else if (players.value.blue?.uid === uid.value) {
-      rtdbRemove(`rooms/${code}/players/blue`).catch(() => {})
-    } else if (players.value.red?.uid === uid.value) {
-      rtdbRemove(`rooms/${code}/players/red`).catch(() => {})
-    } else {
-      rtdbRemove(`rooms/${code}/presence/red`).catch(() => {})
-      rtdbRemove(`rooms/${code}/presence/blue`).catch(() => {})
-    }
+/* 连接建立：DO 会把已保存的 state 回放给新连接（applyRoomSnapshot 处理）；
+   建房者在此立即推送初始 state，让房间在云端有第一份快照 */
+function onWsOpen() {
+  if (pendingCreate) {
+    pendingCreate = false
+    syncState()
   }
+  sendRaw('__who') /* 立即拉一次在线状态 */
+}
+/* 对端掉线广播（DO webSocketClose 发出）→ 立即提示并刷新在线状态 */
+function onPeerClosed(info) {
+  if (info && info.code === 4001) flashTip('对方已被移出房间。', 'warn')
+  else flashTip('对方连接已断开。', 'warn')
+  sendRaw('__who')
+}
+/* DO 拒绝连接（4001 房间已满 / 被踢出，4000 席位被顶替）→ 回大厅 */
+function onWsRejected(code, reason) {
+  if (/踢出/.test(reason || '')) exitRoom('kicked')
+  else if (/顶替/.test(reason || '')) exitRoom('replaced')
+  else exitRoom()
+  lobbyMsg.value = { text: reason || '无法进入房间。', kind: 'err' }
+}
+/* 退出房间：断开 WS 即可（方案 B 无服务端席位删除；离线席位由顶替/踢出机制处理）
+   reason: 'kicked' 被移出 | 'replaced' 席位被顶替 | 其余为主动退出 */
+function exitRoom(reason) {
+  closeWs()
   sessionStorage.removeItem('fh_room')
   roomCode.value = ''
   players.value = {}
@@ -377,9 +335,12 @@ async function exitRoom(reason) {
   blueOnline.value = true
   peerKickable.value = false
   gotRoomSnapshot.value = false
+  iHadSeat = false
+  pendingCreate = false
+  joinPending = null
   roomState.value = 'lobby'
-  if (reason === 'kicked') lobbyMsg.value = { text: '你已被房主移出房间。', kind: 'warn' }
-  if (reason === 'dismissed') lobbyMsg.value = { text: '房主已解散房间。', kind: 'warn' }
+  if (reason === 'kicked') lobbyMsg.value = { text: '你已被移出房间。', kind: 'warn' }
+  if (reason === 'replaced') lobbyMsg.value = { text: '你的席位被新玩家顶替。', kind: 'warn' }
 }
 
 /* ---- 最近加入的房间（localStorage 持久化，最多 5 条） ---- */
@@ -417,23 +378,10 @@ function rejoin(r) {
 
 async function createRoom() {
   if (roomBusy.value) return
-  if (!uid.value) {
-    lobbyMsg.value = { text: '正在连接 Firebase，请稍候再试。', kind: 'err' }
-    return
-  }
   roomBusy.value = true
   try {
-    let code = null
-    for (let i = 0; i < 5; i++) {
-      const c = genCode()
-      const snap = await rtdbGet(`rooms/${c}`)
-      if (snap == null) {
-        code = c
-        break
-      }
-    }
-    if (!code) throw new Error('房间码分配失败，请重试')
-    /* 用当前顶栏设置初始化一局：seed → 棋盘 → 初始 state 写入云端 */
+    const code = genCode() /* DO 按 code 路由，无需向服务器探重名（32^6 碰撞概率可忽略） */
+    /* 用当前顶栏设置初始化一局：seed → 棋盘 → 连接建立后推送初始 state */
     gameState.side = clampSizeInput()
     redrawBoard()
     gameState.phase = 'ready'
@@ -441,12 +389,10 @@ async function createRoom() {
     gameState.log = []
     gameState.undoStack = []
     finishReason.value = ''
-    await rtdbSet(`rooms/${code}`, {
-      meta: { hostUid: uid.value, createdAt: Date.now() },
-      players: { red: { uid: uid.value, name: '赤营' } },
-      state: localToCloudState(),
-    })
+    players.value = { red: { clientId: uid, name: '赤营' }, blue: null }
+    roomMeta.value = { hostId: uid, createdAt: Date.now() }
     lobbyMsg.value = null
+    pendingCreate = true
     enterRoom(code, true)
   } catch (e) {
     lobbyMsg.value = { text: '创建房间失败：' + e.message, kind: 'err' }
@@ -468,53 +414,61 @@ async function joinRoom() {
     lobbyMsg.value = { text: '请先输入房间码。', kind: 'err' }
     return
   }
-  if (!uid.value) {
-    lobbyMsg.value = { text: '正在连接 Firebase，请稍候再试。', kind: 'err' }
-    return
-  }
   roomBusy.value = true
   try {
-    /* meta 对所有登录用户可读：先判断房间存在性 */
-    const meta = await rtdbGet(`rooms/${code}/meta`)
-    if (!meta) {
-      forgetRoom(code)
-      throw new Error('房间不存在（可能已解散），已从最近列表移除')
-    }
-    /* 房间内容对登录用户可读：自己 uid 已在席位（刷新重连 / 换设备回来的房主）→ 直接恢复 */
-    const pl = (await rtdbGet(`rooms/${code}/players`)) || {}
-    if (!((pl.red && pl.red.uid === uid.value) || (pl.blue && pl.blue.uid === uid.value))) {
-      /* 选席位：空席优先；两席都空进青营；被占席仅在原占者离线超 3 分钟时可顶替，
-         两席都可顶替时选离线时间更长者（presence 缺失视为离线最久） */
-      const pr = (await rtdbGet(`rooms/${code}/presence`)) || {}
-      const awayMs = (seat) => {
-        const uid0 = pl[seat] && pl[seat].uid
-        if (!uid0) return 0 /* 空席 */
-        const ts = pr[seat]
-        return typeof ts === 'number' ? Date.now() - ts : Infinity /* 心跳缺失视为离线最久 */
-      }
-      const away3 = (seat) => !!(pl[seat] && pl[seat].uid) && awayMs(seat) > 180000
-      const empty = (seat) => !pl[seat] || !pl[seat].uid
-      let target = null
-      if (empty('blue') && empty('red')) target = 'blue'
-      else if (empty('blue')) target = 'blue'
-      else if (empty('red')) target = 'red'
-      else if (away3('blue') && away3('red')) target = awayMs('red') > awayMs('blue') ? 'red' : 'blue'
-      else if (away3('blue')) target = 'blue'
-      else if (away3('red')) target = 'red'
-      if (!target) {
-        throw new Error('房间已满（赤青两营均有玩家且都在线）。若一方离线超过 3 分钟，可顶替其席位加入。')
-      }
-      const replacing = !empty(target)
-      await rtdbPatch(`rooms/${code}/players/${target}`, { uid: uid.value, name: target === 'red' ? '赤营' : '青营' })
-      if (replacing) flashTip(`原${target === 'red' ? '赤营' : '青营'}离线超过 3 分钟，你已顶替其席位。`, 'ok')
-    }
-    /* 房主重连、已在席位恢复、或占位/顶替成功，都直接进入 */
     lobbyMsg.value = null
-    enterRoom(code, meta.hostUid === uid.value)
-  } catch (e) {
-    lobbyMsg.value = { text: '加入房间失败：' + e.message, kind: 'err' }
+    joinPending = { code, decided: false }
+    enterRoom(code, false)
+    /* 快照与 __who 到齐后由 decideSeat 完成选席；3 秒内无快照 → 房间不存在 */
+    setTimeout(() => {
+      if (joinPending && !joinPending.decided && roomState.value === 'playing' && !gotRoomSnapshot.value) {
+        forgetRoom(code)
+        exitRoom()
+        lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
+      }
+      joinPending = null
+    }, 3000)
   } finally {
     roomBusy.value = false
+  }
+}
+/* 加入选席：clientId 已在席位 → 恢复（刷新/换设备回来）；空席优先（全空进青营）；
+   占席仅当占者离线超 3 分钟（__who 无记录或 lastSeen 过期）可顶替，并对其瞬时踢人 */
+function maybeDecideSeat() {
+  if (joinPending && !joinPending.decided && gotRoomSnapshot.value) decideSeat()
+}
+function decideSeat() {
+  const jp = joinPending
+  if (!jp || jp.decided) return
+  jp.decided = true
+  const now = Date.now()
+  const p = players.value || {}
+  if (seatOf(uid)) return /* 已在席位：直接恢复 */
+  const lastSeen = (cid) => {
+    const peer = lastPeers.find((x) => x.clientId === cid)
+    return peer ? peer.lastSeen || 0 : 0
+  }
+  const empty = (s) => !p[s] || !p[s].clientId
+  const away3 = (s) => !empty(s) && now - lastSeen(p[s].clientId) > 180000
+  let target = null
+  if (empty('blue') && empty('red')) target = 'blue'
+  else if (empty('blue')) target = 'blue'
+  else if (empty('red')) target = 'red'
+  else if (away3('blue') && away3('red')) target = lastSeen(p.red.clientId) <= lastSeen(p.blue.clientId) ? 'red' : 'blue'
+  else if (away3('blue')) target = 'blue'
+  else if (away3('red')) target = 'red'
+  if (!target) {
+    exitRoom()
+    lobbyMsg.value = { text: '房间已满（赤青两营均有玩家且都在线）。一方离线超过 3 分钟后可顶替加入。', kind: 'err' }
+    return
+  }
+  const replacing = !empty(target)
+  const oldCid = replacing ? p[target].clientId : null
+  players.value = { ...p, [target]: { clientId: uid, name: target === 'red' ? '赤营' : '青营' } }
+  syncState()
+  if (replacing) {
+    sendKick(oldCid) /* 瞬时踢人：DO 直接关掉对方残留的 ws（若有） */
+    flashTip(`原${target === 'red' ? '赤营' : '青营'}离线超过 3 分钟，你已顶替其席位。`, 'ok')
   }
 }
 
@@ -532,17 +486,16 @@ watch([myTeam, roomState], () => {
   const mine = myTeam.value === 'A' ? p.red : myTeam.value === 'B' ? p.blue : null
   teamNameInput.value = mine && mine.name && mine.name !== TEAM_NAME[myTeam.value] ? mine.name : ''
 })
-async function saveTeamName() {
+function saveTeamName() {
   if (!myTeam.value || !roomCode.value) return
   const name = teamNameInput.value.trim()
   if (!name) { flashTip('阵营名不能为空。', 'warn'); return }
   if (name.length > 12) { flashTip('阵营名最多 12 个字。', 'err'); return }
-  try {
-    await rtdbPatch(`rooms/${roomCode.value}/players/${myTeam.value === 'A' ? 'red' : 'blue'}`, { name })
-    flashTip('✓ 阵营名已更新，双方界面与战报图都会显示新名字。', 'ok')
-  } catch (e) {
-    flashTip('改名失败：' + (e && e.message), 'err')
-  }
+  const seat = myTeam.value === 'A' ? 'red' : 'blue'
+  const p = players.value || {}
+  players.value = { ...p, [seat]: { ...(p[seat] || { clientId: uid }), name } }
+  syncState()
+  flashTip('✓ 阵营名已更新，双方界面与战报图都会显示新名字。', 'ok')
 }
 const TEAM_MARK = { A: '赤', B: '青' }
 
@@ -1167,34 +1120,19 @@ function lockHint() {
 }
 
 /* ================= 启动 ================= */
-onMounted(async () => {
-  try {
-    const me = await ensureAuth()
-    uid.value = me.uid
-    fbStatus.value = 'ok'
-  } catch (e) {
-    fbStatus.value = 'error'
-    fbError.value = e.message
-  }
-  /* 断线重连：sessionStorage 记住了房间码就直接回到房间 */
+onMounted(() => {
+  /* 断线重连：sessionStorage 记住了房间码就直接回连（clientId 在席位内则自动恢复原席位） */
   const saved = sessionStorage.getItem('fh_room')
-  if (saved && uid.value) {
-    try {
-      const snap = await rtdbGet(`rooms/${saved}`)
-      if (snap) enterRoom(saved, snap.meta && snap.meta.hostUid === uid.value)
-      else sessionStorage.removeItem('fh_room')
-    } catch (e) {
-      sessionStorage.removeItem('fh_room')
-    }
+  if (saved) {
+    joinCode.value = saved
+    joinRoom()
   }
   redrawBoard()
-  document.addEventListener('visibilitychange', onVisibilityChange)
 })
 onBeforeUnmount(() => {
   if (changedTimer) clearTimeout(changedTimer)
   window.removeEventListener('resize', sizeCellFont)
-  document.removeEventListener('visibilitychange', onVisibilityChange)
-  stopPolling()
+  closeWs()
 })
 onMounted(() => window.addEventListener('resize', sizeCellFont))
 </script>
@@ -1253,7 +1191,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
               <button :disabled="roomBusy || !uid" title="房主重连或以青营加入；房间已被解散时会有提示" @click="rejoin(r)">进入</button>
             </div>
           </div>
-          <p v-if="uid" class="uidline">匿名 UID：{{ uid }}</p>
+          <p v-if="uid" class="uidline">设备 ID：{{ uid }}</p>
         </div>
       </div>
     </div>
