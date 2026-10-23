@@ -33,8 +33,7 @@ const lobbyStatusText = computed(
     ({
       connecting: '正在连接服务器…',
       ok: '已连接服务器，等待创建房间',
-      lost: '连接断开，正在重连…',
-      error: '连接失败：' + fbError.value,
+      /* 大厅本来就没有连接：lost/error 是房间内残留状态，不显示（加入失败另有 lobbyMsg 提示） */
     }[fbStatus.value] || '')
 )
 
@@ -1351,7 +1350,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
     <header class="top">
       <h1>飞花斯普拉遁</h1>
       <div class="head-tools">
-        <span v-if="!isLocalMode" class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
+        <span v-if="!isLocalMode && roomState !== 'lobby'" class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
         <span style="color:#98a4b3;font-size:12px;margin-left:6px;font-weight:600">v3.1</span>
         <span v-if="roomState === 'playing'" class="conn room">{{ isLocalMode ? '本地主持台' : '房间 ' + roomCode }}</span>
         <template v-if="roomState === 'playing'">
