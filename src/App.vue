@@ -897,9 +897,18 @@ const onExportGif = () => exportShotGif(exportGameCtx(), flashTip)
 /* 出手前预览：输入句命中的格子刷成己方阵营的半透明色（对方回合也可作草稿预览） */
 const poemInput = ref('')
 const previewSet = ref(new Set())
-/* 选字环节（ready）：点击棋盘字取消（格标记 cut），再点字库字补位；取消与补位相等（棋盘无空缺）才能开局。
+/* 选字环节（ready）：点击棋盘字或字库里的同字取消（格标记 cut），再点别的字补位；取消与补位相等（棋盘无空缺）才能开局。
    只改当前这一盘的 board，不碰字库池、不重抽；重抽/再来一局自动重置。 */
 const removedCells = ref(new Set())
+/* 被取消格当前对应的字集合（字库列表同步显示划线态；补位后随 board 自动更新） */
+const removedChars = computed(() => {
+  const s = new Set()
+  for (const i of removedCells.value) {
+    const c = gameState.board[i]
+    if (c && c.ch) s.add(c.ch)
+  }
+  return s
+})
 function toggleRemovedCell(idx) {
   const s = new Set(removedCells.value)
   if (s.has(idx)) s.delete(idx)
@@ -908,12 +917,14 @@ function toggleRemovedCell(idx) {
 }
 function onPoolSwapPick(ch) {
   if (gameState.phase !== 'ready') return
-  if (!removedCells.value.size) {
-    flashTip('先在棋盘上点击要换掉的字（取消选中），再来字库里点新字补位。', 'warn')
+  /* 字库点字与棋盘点字等价：棋盘上的字 → 取消/恢复（被取消的字仍占格，poolOn 仍为真，toggle 即恢复）；棋盘外的字 → 补位 */
+  if (poolOn.value[ch]) {
+    const idx = gameState.board.findIndex((c) => c.ch === ch)
+    if (idx >= 0) toggleRemovedCell(idx)
     return
   }
-  if (poolOn.value[ch]) {
-    flashTip(`「${ch}」已在棋盘上，换字不能产生重复字。`, 'warn')
+  if (!removedCells.value.size) {
+    flashTip('先取消棋盘上的字（点棋盘或点下方字库），再来点新字补位。', 'warn')
     return
   }
   const idx = [...removedCells.value][0]
@@ -1290,7 +1301,7 @@ const redrawLabel = computed(() => (gameState.phase === 'over' ? '再来一局' 
 function startGame() {
   if (gameState.phase === 'playing') return
   if (removedCells.value.size) {
-    flashTip(`还有 ${removedCells.value.size} 个被取消的棋盘字未补位：在下方字库点字补齐，或再次点击棋盘字恢复。`, 'err')
+    flashTip(`还有 ${removedCells.value.size} 个被取消的字未处理：点字库新字补齐，或再点该字（棋盘/字库均可）恢复。`, 'err')
     return
   }
   /* 改了尺寸但没触发 change：先按新尺寸重铺，否则会拿旧棋盘开局 */
@@ -1512,11 +1523,12 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                         @click="selectAllPools" title="七个字库全部参与（默认）">全选</button>
               </div>
               <div class="poolgrid swap">
-                <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] }"
-                      title="点击用该字补位棋盘上被取消的字（该字不能已在棋盘上）"
+                <span v-for="ch in activePool" :key="ch"
+                      :class="{ on: poolOn[ch] && !removedChars.has(ch), cut: removedChars.has(ch) }"
+                      :title="poolOn[ch] ? (removedChars.has(ch) ? '已取消，点击恢复' : '点击取消棋盘上的该字') : '点击用该字补位被取消的棋盘字'"
                       @click="onPoolSwapPick(ch)">{{ ch }}</span>
               </div>
-              <p class="poolnote">勾选的字库集合取并集去重后构成基础字库。开局前可换字：先点棋盘上不要的字（取消选中，再点恢复），再在这里点新字补位；取消与补位数量相等（棋盘无空缺）才能开局。换字只影响本盘，重抽/再来一局会重铺。</p>
+              <p class="poolnote">勾选的字库集合取并集去重后构成基础字库。开局前可换字：点棋盘上（或下方字库里）不要的字取消选中，再点别的字补位；取消与补位数量相等（棋盘无空缺）才能开局。换字只影响本盘，重抽/再来一局会重铺。</p>
             </div>
           </details>
           <details>
@@ -1740,6 +1752,7 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .row.center{justify-content:center;}
 .poolgrid.swap span{cursor:pointer;user-select:none;transition:.12s;}
 .poolgrid.swap span:hover{transform:scale(1.12);}
+.poolgrid.swap span.cut{opacity:.4;text-decoration:line-through;}
 .cell.cut{opacity:.35;text-decoration:line-through;outline:2px dashed #D98A80;outline-offset:-3px;}
 .ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
 .ghost-del:hover{background:#FBEDEA;}
