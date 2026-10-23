@@ -74,6 +74,7 @@ function kickPeer() {
   if (target) sendKick(target) /* 瞬时踢人：DO 直接 close 对方 ws（若仍连着） */
   players.value = { ...p, [seat]: null }
   syncState()
+  sendRaw('__who') /* 立即刷新在线状态，不等 15s 轮询 */
   flashTip('对方席位已空出。', 'ok')
 }
 /* 回合锁：只有轮到自己阵营时才能出牌（观战身份不能出牌） */
@@ -228,6 +229,7 @@ function syncState() {
    席位不再自动移除——离线满 3 分钟由新成员加入时顶替，或在席玩家手动踢出 ---- */
 let lastPeers = []
 let lastTakeoverAt = 0
+let whoSeen = false /* 已收到过至少一次 __who：decideSeat/接管的前置条件（防快照先到时 lastPeers 为空误判） */
 function seatOf(cid) {
   const p = players.value || {}
   if (p.red && p.red.clientId === cid) return 'red'
@@ -236,6 +238,7 @@ function seatOf(cid) {
 }
 function onWho(peers, at) {
   lastPeers = peers || []
+  whoSeen = true
   const now = at || Date.now()
   const lastSeen = (cid) => {
     const peer = lastPeers.find((x) => x.clientId === cid)
@@ -254,6 +257,7 @@ function onWho(peers, at) {
 function maybeTakeover(now) {
   const host = roomMeta.value && roomMeta.value.hostId
   if (!host || host === uid || !myTeam.value || !roomCode.value) return
+  if (!whoSeen) return /* 还没收到过 __who：房主在线与否未知，禁止接管 */
   if (now - lastTakeoverAt < 30000) return
   const hostInSeat = !!seatOf(host)
   const hostLive = lastPeers.some((x) => x.clientId === host && now - (x.lastSeen || 0) < 180000)
@@ -336,6 +340,8 @@ function exitRoom(reason) {
   peerKickable.value = false
   gotRoomSnapshot.value = false
   iHadSeat = false
+  whoSeen = false
+  lastPeers = []
   pendingCreate = false
   joinPending = null
   roomState.value = 'lobby'
@@ -421,21 +427,29 @@ async function joinRoom() {
     enterRoom(code, false)
     /* 快照与 __who 到齐后由 decideSeat 完成选席；3 秒内无快照 → 房间不存在 */
     setTimeout(() => {
-      if (joinPending && !joinPending.decided && roomState.value === 'playing' && !gotRoomSnapshot.value) {
-        forgetRoom(code)
-        exitRoom()
-        lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
+      if (joinPending && !joinPending.decided) {
+        if (!gotRoomSnapshot.value) {
+          forgetRoom(code)
+          exitRoom()
+          lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
+          joinPending = null
+        } else if (whoSeen) {
+          decideSeat() /* 兜底：__who 已到但竞速错过 maybeDecideSeat */
+        }
+        /* 快照已到、__who 未到：不置 null，等 onWho → maybeDecideSeat 完成选席 */
+      } else if (joinPending) {
+        joinPending = null
       }
-      joinPending = null
     }, 3000)
   } finally {
     roomBusy.value = false
   }
 }
 /* 加入选席：clientId 已在席位 → 恢复（刷新/换设备回来）；空席优先（全空进青营）；
-   占席仅当占者离线超 3 分钟（__who 无记录或 lastSeen 过期）可顶替，并对其瞬时踢人 */
+   占席仅当「已收到过 __who 且占席者确实离线」（不在连接池，或 lastSeen 过期超 3 分钟）才顶替，
+   并对其瞬时踢人。快照先于 __who 到达时 lastPeers 为空，此时绝不顶替——等待 __who 再决策。 */
 function maybeDecideSeat() {
-  if (joinPending && !joinPending.decided && gotRoomSnapshot.value) decideSeat()
+  if (joinPending && !joinPending.decided && gotRoomSnapshot.value && whoSeen) decideSeat()
 }
 function decideSeat() {
   const jp = joinPending
@@ -444,12 +458,13 @@ function decideSeat() {
   const now = Date.now()
   const p = players.value || {}
   if (seatOf(uid)) return /* 已在席位：直接恢复 */
+  const inPool = (cid) => lastPeers.some((x) => x.clientId === cid) /* 不在连接池 = 对方无任何连接，可顶替 */
   const lastSeen = (cid) => {
     const peer = lastPeers.find((x) => x.clientId === cid)
     return peer ? peer.lastSeen || 0 : 0
   }
   const empty = (s) => !p[s] || !p[s].clientId
-  const away3 = (s) => !empty(s) && now - lastSeen(p[s].clientId) > 180000
+  const away3 = (s) => !empty(s) && (!inPool(p[s].clientId) || now - lastSeen(p[s].clientId) > 180000)
   let target = null
   if (empty('blue') && empty('red')) target = 'blue'
   else if (empty('blue')) target = 'blue'
@@ -464,7 +479,13 @@ function decideSeat() {
   }
   const replacing = !empty(target)
   const oldCid = replacing ? p[target].clientId : null
-  players.value = { ...p, [target]: { clientId: uid, name: target === 'red' ? '赤营' : '青营' } }
+  const other = target === 'red' ? 'blue' : 'red'
+  /* 坐席 + 脏数据自愈：若另一席残留着我的 clientId（异常历史 state），一并清掉 */
+  players.value = {
+    ...p,
+    [target]: { clientId: uid, name: target === 'red' ? '赤营' : '青营' },
+    [other]: p[other] && p[other].clientId === uid ? null : p[other],
+  }
   syncState()
   if (replacing) {
     sendKick(oldCid) /* 瞬时踢人：DO 直接关掉对方残留的 ws（若有） */
