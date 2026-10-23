@@ -7,9 +7,12 @@
        __who                               → 回 {__who:[{clientId,lastSeen,self}]}（仅发给请求者）
        {"type":"kick","targetClientId"}    → 在连接池找到目标 ws 立即 close(4001,'被踢出房间')；找不到（已离线）则忽略
    - webSocketClose：给剩余连接广播 {__peer_closed:{code}}，对端 UI 立即显示离线/被踢
-   - 满员策略：已有 2 个连接时，第三人可顶替「静默超 10 分钟」的连接，否则 close(4001,'房间已满')
+   - 满员策略：已有 2 个连接且全部活跃（心跳 <75s）时拒绝第三人；存在静默超 75s 的连接则放行第三人，
+     被顶替者由前端业务层按 clientId 精确 sendKick（DO 不解析席位归属）
+   - 房间回收：state 超 24 小时未更新（双方均离线超过 24h）→ 清空 storage + D1，房间视为不存在
    持久化说明：storage.put 为权威副本（hibernate 唤醒用）；D1 rooms 表为备份/审计，恢复时仅作回退。 */
-const STALE_MS = 10 * 60 * 1000 /* 静默 10 分钟的连接可被第三人顶替 */
+const STALE_MS = 75 * 1000 /* 静默 75s（心跳 60s + 容差）的连接视为离线，可被第三人顶替 */
+const ROOM_TTL = 24 * 60 * 60 * 1000 /* state 超过 24h 未更新 → 房间回收 */
 
 export class GameRoom {
   constructor(state, env) {
@@ -33,22 +36,18 @@ export class GameRoom {
     const sockets = this.state.getWebSockets()
     const now = Date.now()
 
-    /* 满员判定：2 个连接时找「静默超 10 分钟」的可顶替对象 */
+    /* 满员判定：两个连接都活跃 → 拒绝第三人；存在静默超 75s 的连接 → 放行，
+       被顶替者由前端业务层 sendKick（按 clientId 精确关闭） */
     if (sockets.length >= 2) {
-      let stale = null
-      for (const s of sockets) {
+      const hasStale = sockets.some((s) => {
         const meta = readMeta(s)
-        if (!meta || now - meta.lastSeen > STALE_MS) {
-          stale = s
-          break
-        }
-      }
-      if (!stale) {
+        return !meta || now - meta.lastSeen > STALE_MS
+      })
+      if (!hasStale) {
         server.accept()
-        server.close(4001, '房间已满（两名玩家都在线）')
+        server.close(4001, '房间已满（赤青两营均有玩家且都在线）')
         return
       }
-      stale.close(4000, '席位被新连接顶替')
     }
 
     /* Hibernation 模式：只允许 state.acceptWebSocket()，不能再手动 accept()（二者互斥） */
@@ -57,16 +56,29 @@ export class GameRoom {
     /* roomId 兜底：hibernate 唤醒后构造器重跑、this.roomId 为空，从 storage 恢复 */
     if (this.roomId) await this.state.storage.put('room_id', this.roomId)
 
-    /* 状态恢复：最近一次保存的 gameState 直接发给新连接的玩家 */
-    let saved = await this.state.storage.get('room_state')
-    if (!saved) {
+    /* 状态恢复：最近一次保存的 gameState 直接发给新连接的玩家；
+       state 超 24h 未更新（双方均离线超 24h）→ 清掉旧局，房间视为不存在 */
+    const savedAt = await this.state.storage.get('room_saved_at')
+    let saved = null
+    if (savedAt && now - savedAt > ROOM_TTL) {
+      await this.state.storage.delete('room_state')
+      await this.state.storage.delete('room_saved_at')
       try {
-        const row = await this.env.DB.prepare('SELECT state FROM rooms WHERE room_id = ?1')
-          .bind(this.roomId)
-          .first()
-        if (row && row.state) saved = row.state
+        await this.env.DB.prepare('DELETE FROM rooms WHERE room_id = ?1').bind(this.roomId).run()
       } catch (e) {
-        console.error('d1 restore failed', e)
+        console.error('d1 delete failed', e)
+      }
+    } else {
+      saved = await this.state.storage.get('room_state')
+      if (!saved) {
+        try {
+          const row = await this.env.DB.prepare('SELECT state FROM rooms WHERE room_id = ?1')
+            .bind(this.roomId)
+            .first()
+          if (row && row.state) saved = row.state
+        } catch (e) {
+          console.error('d1 restore failed', e)
+        }
       }
     }
     if (saved) server.send(saved)
@@ -147,8 +159,9 @@ export class GameRoom {
   }
 
   async persist(message) {
+    const now = Date.now()
     try {
-      await this.state.storage.put('room_state', message)
+      await this.state.storage.put({ room_state: message, room_saved_at: now })
     } catch (e) {
       console.error('storage put failed', e)
     }
@@ -159,7 +172,7 @@ export class GameRoom {
         `INSERT INTO rooms (room_id, state, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(room_id) DO UPDATE SET state = ?2, updated_at = ?3`
       )
-        .bind(rid, message, Date.now())
+        .bind(rid, message, now)
         .run()
     } catch (e) {
       console.error('d1 save failed', e)

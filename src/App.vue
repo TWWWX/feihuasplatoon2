@@ -62,9 +62,9 @@ const myTeam = computed(() => {
    对方离线只做「标记」，不暂停对战：对方离线时仍可正常提交（同步不依赖对方在线）。 */
 const redOnline = ref(true)
 const blueOnline = ref(true)
-const peerKickable = ref(false) /* 对方离线满 3 分钟：徽标变踢出按钮 */
+const peerKickable = ref(false) /* 对方离线满 1 分钟（离线 70s 再持续 60s）：徽标变踢出按钮 */
 const gotRoomSnapshot = ref(false)
-/* 对方席位离线（90 秒无 pong）：显示横幅与徽标；满 3 分钟徽标变踢出按钮，也可被新成员顶替 */
+/* 对方席位离线（70 秒无心跳）：显示横幅与徽标；离线满 1 分钟徽标变踢出按钮（手动踢），也可被新成员顶替 */
 const peerOffline = computed(
   () =>
     roomState.value === 'playing' &&
@@ -77,8 +77,12 @@ function kickPeer() {
   const seat = myTeam.value === 'A' ? 'blue' : 'red'
   const p = players.value || {}
   const target = p[seat] && p[seat].clientId
-  if (!confirm(`将「${teamNames.value[myTeam.value === 'A' ? 'B' : 'A']}」移出房间？对方会立刻回到大厅，席位空出后新人可加入（需对方离线超过 3 分钟）。`)) return
+  if (!confirm(`将「${teamNames.value[myTeam.value === 'A' ? 'B' : 'A']}」移出房间？对方会立刻回到大厅，席位空出。`)) return
   if (target) sendKick(target) /* 瞬时踢人：DO 直接 close 对方 ws（若仍连着） */
+  /* 被踢者是房主 → 房主转让给另一席（我） */
+  if (target && roomMeta.value && roomMeta.value.hostId === target) {
+    roomMeta.value = { ...roomMeta.value, hostId: uid }
+  }
   players.value = { ...p, [seat]: null }
   syncState()
   sendRaw('__who') /* 立即刷新在线状态，不等 15s 轮询 */
@@ -222,7 +226,7 @@ function applyRoomSnapshot(st) {
   gameState.turnNo = local.turnNo
   gameState.log = local.log
   gameState.phase = local.phase
-  maybeDecideSeat()
+  ensureSeat()
 }
 
 /* ---- 把本地最新状态整体推给 DO（提交/放弃/撤销/结算/开局/重抽/改名/占席共用） ----
@@ -232,11 +236,11 @@ function syncState() {
   sendRaw(JSON.stringify(localToCloudState()))
 }
 
-/* ---- 在线状态与房主接管（由 DO __who 驱动，useWebSocket 每 15s 拉一次） ----
-   席位不再自动移除——离线满 3 分钟由新成员加入时顶替，或在席玩家手动踢出 ---- */
+/* ---- 在线状态（由 DO __who 驱动，useWebSocket 每 15s 拉一次） ----
+   席位规则：对方离线只做标记，不自动移除；手动踢出、被新人顶替均即时生效。
+   阈值：离线判定 70s（心跳 60s + 容差）；离线满 1 分钟（累计 130s）出现「踢出」按钮。 */
 let lastPeers = []
-let lastTakeoverAt = 0
-let whoSeen = false /* 已收到过至少一次 __who：decideSeat/接管的前置条件（防快照先到时 lastPeers 为空误判） */
+let whoSeen = false /* 已收到过至少一次 __who：ensureSeat 的前置条件（防快照先到时 lastPeers 为空误判） */
 function seatOf(cid) {
   const p = players.value || {}
   if (p.red && p.red.clientId === cid) return 'red'
@@ -251,43 +255,85 @@ function onWho(peers, at) {
     const peer = lastPeers.find((x) => x.clientId === cid)
     return peer ? peer.lastSeen || 0 : 0 /* 不在连接池 = 已彻底离线，视为最久 */
   }
-  const fresh = (cid) => now - lastSeen(cid) < 90000 /* __ping 60s + 抖动余量 */
+  const fresh = (cid) => now - lastSeen(cid) < 70000 /* 心跳 60s + 抖动余量 */
   const p = players.value || {}
   redOnline.value = !p.red || p.red.clientId === uid || fresh(p.red.clientId)
   blueOnline.value = !p.blue || p.blue.clientId === uid || fresh(p.blue.clientId)
   const otherSeat = myTeam.value === 'A' ? 'blue' : myTeam.value === 'B' ? 'red' : null
   peerKickable.value =
-    !!otherSeat && !!gotRoomSnapshot.value && !!p[otherSeat] && now - lastSeen(p[otherSeat].clientId) > 180000
-  maybeTakeover(now)
+    !!otherSeat && !!gotRoomSnapshot.value && !!p[otherSeat] && now - lastSeen(p[otherSeat].clientId) > 130000
+  ensureSeat() /* 无席兜底：竞速遗漏的观战态在这里自愈 */
 }
-/* 房主接管：hostId 不是我，且房主已不在席位（被顶替/踢出后残留）或离线超 3 分钟 → 我接管 */
-function maybeTakeover(now) {
-  const host = roomMeta.value && roomMeta.value.hostId
-  if (!host || host === uid || !myTeam.value || !roomCode.value) return
-  if (!whoSeen) return /* 还没收到过 __who：房主在线与否未知，禁止接管 */
-  if (now - lastTakeoverAt < 30000) return
-  const hostInSeat = !!seatOf(host)
-  const hostLive = lastPeers.some((x) => x.clientId === host && now - (x.lastSeen || 0) < 180000)
-  if (!hostInSeat || !hostLive) {
+
+/* ---- 坐席兜底（替代原 joinPending 单次选席）：房内但无席时随时补坐 ----
+   空席优先（全空进青营）；占席仅当占席者已离线（不在连接池或 lastSeen 过期超 70s），
+   双席均离线时顶离线更久者；被顶者是房主 → 房主随之转让。
+   两席均有人且在线：新加入者退出回大厅；曾占席者等待顶替者的踢出广播。 */
+function ensureSeat() {
+  if (!roomCode.value || seatOf(uid)) return
+  if (!whoSeen || !gotRoomSnapshot.value) return
+  const now = Date.now()
+  const p = players.value || {}
+  const inPool = (cid) => lastPeers.some((x) => x.clientId === cid) /* 不在连接池 = 对方无任何连接，可顶替 */
+  const lastSeen = (cid) => {
+    const peer = lastPeers.find((x) => x.clientId === cid)
+    return peer ? peer.lastSeen || 0 : 0
+  }
+  const empty = (s) => !p[s] || !p[s].clientId
+  const away = (s) => !empty(s) && (!inPool(p[s].clientId) || now - lastSeen(p[s].clientId) > 70000)
+  let target = null
+  if (empty('blue') && empty('red')) target = 'blue'
+  else if (empty('blue')) target = 'blue'
+  else if (empty('red')) target = 'red'
+  else if (away('blue') && away('red')) target = lastSeen(p.red.clientId) <= lastSeen(p.blue.clientId) ? 'red' : 'blue'
+  else if (away('blue')) target = 'blue'
+  else if (away('red')) target = 'red'
+  if (!target) {
+    if (joinPending && !joinPending.decided) {
+      joinPending.decided = true
+      exitRoom()
+      lobbyMsg.value = { text: '房间已满（赤青两营均有玩家且都在线）。', kind: 'err' }
+    }
+    return
+  }
+  if (joinPending) joinPending.decided = true
+  const replacing = !empty(target)
+  const oldCid = replacing ? p[target].clientId : null
+  const other = target === 'red' ? 'blue' : 'red'
+  /* 坐席 + 脏数据自愈：若另一席残留着我的 clientId（异常历史 state），一并清掉 */
+  players.value = {
+    ...p,
+    [target]: { clientId: uid, name: target === 'red' ? '赤营' : '青营' },
+    [other]: p[other] && p[other].clientId === uid ? null : p[other],
+  }
+  /* 被顶者是房主 → 房主转让给坐席者 */
+  if (replacing && roomMeta.value && roomMeta.value.hostId === oldCid) {
     roomMeta.value = { ...roomMeta.value, hostId: uid }
-    syncState()
-    lastTakeoverAt = Date.now()
-    flashTip(hostInSeat ? '房主离线超过 3 分钟，你已接管房间。' : '房间无主，你已成为房主。', 'ok')
+  }
+  syncState()
+  if (replacing) {
+    sendKick(oldCid) /* 瞬时踢人：DO 直接关掉对方残留的 ws（若有） */
+    flashTip(`原${target === 'red' ? '赤营' : '青营'}已离线，你已加入其席位。`, 'ok')
   }
 }
 
-/* ---- 单人房间切换阵营（赤 ⇄ 青）：先占对方空席，再释放自己原席 ---- */
-function switchSide() {
-  if (!roomCode.value || !myTeam.value) return
-  const toSeat = myTeam.value === 'A' ? 'blue' : 'red'
-  const fromSeat = myTeam.value === 'A' ? 'red' : 'blue'
+/* ---- 切换阵营（点击棋盘上方的阵营标签触发）：目标席为空时，先占目标席再释放原席 ---- */
+function pickTeam(t) {
+  if (!roomCode.value) return
+  if (!myTeam.value || myTeam.value === t) return
+  if (!canSwitchSide.value) {
+    flashTip('对方在座时不能切换阵营。', 'warn')
+    return
+  }
+  const toSeat = t === 'A' ? 'red' : 'blue'
+  const fromSeat = t === 'A' ? 'blue' : 'red'
   players.value = {
     ...players.value,
     [toSeat]: { clientId: uid, name: toSeat === 'red' ? '赤营' : '青营' },
     [fromSeat]: null,
   }
   syncState()
-  flashTip(`已切换到${toSeat === 'red' ? '赤营' : '青营'}席位。`, 'ok')
+  flashTip(`已切换到${t === 'A' ? '赤营' : '青营'}席位。`, 'ok')
 }
 const canSwitchSide = computed(() => {
   const p = players.value || {}
@@ -334,9 +380,18 @@ function onWsRejected(code, reason) {
   else exitRoom()
   lobbyMsg.value = { text: reason || '无法进入房间。', kind: 'err' }
 }
-/* 退出房间：断开 WS 即可（方案 B 无服务端席位删除；离线席位由顶替/踢出机制处理）
+/* 退出房间：主动退出时若我是房主且另一席有人 → 先转让房主再断开（房主仅是创建者标记，无权限差异）
    reason: 'kicked' 被移出 | 'replaced' 席位被顶替 | 其余为主动退出 */
 function exitRoom(reason) {
+  if (!reason && roomCode.value && myTeam.value) {
+    const host = roomMeta.value && roomMeta.value.hostId
+    const otherSeat = myTeam.value === 'A' ? 'blue' : 'red'
+    const other = (players.value || {})[otherSeat]
+    if (host === uid && other && other.clientId) {
+      roomMeta.value = { ...roomMeta.value, hostId: other.clientId }
+      syncState() /* 推送转让后再断开，DO 异步持久化不丢 */
+    }
+  }
   closeWs()
   sessionStorage.removeItem('fh_room')
   roomCode.value = ''
@@ -432,74 +487,24 @@ async function joinRoom() {
     lobbyMsg.value = null
     joinPending = { code, decided: false }
     enterRoom(code, false)
-    /* 快照与 __who 到齐后由 decideSeat 完成选席；3 秒内无快照 → 房间不存在 */
+    /* 坐席由 ensureSeat 兜底（快照/__who 到齐即补坐）；3 秒内无快照 → 房间不存在 */
     setTimeout(() => {
-      if (joinPending && !joinPending.decided) {
-        if (!gotRoomSnapshot.value) {
-          forgetRoom(code)
-          exitRoom()
-          lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
-          joinPending = null
-        } else if (whoSeen) {
-          decideSeat() /* 兜底：__who 已到但竞速错过 maybeDecideSeat */
-        }
-        /* 快照已到、__who 未到：不置 null，等 onWho → maybeDecideSeat 完成选席 */
-      } else if (joinPending) {
+      if (!joinPending) return
+      if (!gotRoomSnapshot.value) {
+        forgetRoom(code)
+        exitRoom()
+        lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
         joinPending = null
+      } else if (whoSeen) {
+        ensureSeat() /* 兜底：__who 已到但竞速错过 onWho 的 ensureSeat */
+        joinPending = null /* 快照已到，房间存在性已判定；后续选席由 ensureSeat 常驻兜底 */
       }
+      /* 快照已到、__who 未到：保留 joinPending，等 onWho → ensureSeat 完成选席 */
     }, 3000)
   } finally {
     roomBusy.value = false
   }
 }
-/* 加入选席：clientId 已在席位 → 恢复（刷新/换设备回来）；空席优先（全空进青营）；
-   占席仅当「已收到过 __who 且占席者确实离线」（不在连接池，或 lastSeen 过期超 3 分钟）才顶替，
-   并对其瞬时踢人。快照先于 __who 到达时 lastPeers 为空，此时绝不顶替——等待 __who 再决策。 */
-function maybeDecideSeat() {
-  if (joinPending && !joinPending.decided && gotRoomSnapshot.value && whoSeen) decideSeat()
-}
-function decideSeat() {
-  const jp = joinPending
-  if (!jp || jp.decided) return
-  jp.decided = true
-  const now = Date.now()
-  const p = players.value || {}
-  if (seatOf(uid)) return /* 已在席位：直接恢复 */
-  const inPool = (cid) => lastPeers.some((x) => x.clientId === cid) /* 不在连接池 = 对方无任何连接，可顶替 */
-  const lastSeen = (cid) => {
-    const peer = lastPeers.find((x) => x.clientId === cid)
-    return peer ? peer.lastSeen || 0 : 0
-  }
-  const empty = (s) => !p[s] || !p[s].clientId
-  const away3 = (s) => !empty(s) && (!inPool(p[s].clientId) || now - lastSeen(p[s].clientId) > 180000)
-  let target = null
-  if (empty('blue') && empty('red')) target = 'blue'
-  else if (empty('blue')) target = 'blue'
-  else if (empty('red')) target = 'red'
-  else if (away3('blue') && away3('red')) target = lastSeen(p.red.clientId) <= lastSeen(p.blue.clientId) ? 'red' : 'blue'
-  else if (away3('blue')) target = 'blue'
-  else if (away3('red')) target = 'red'
-  if (!target) {
-    exitRoom()
-    lobbyMsg.value = { text: '房间已满（赤青两营均有玩家且都在线）。一方离线超过 3 分钟后可顶替加入。', kind: 'err' }
-    return
-  }
-  const replacing = !empty(target)
-  const oldCid = replacing ? p[target].clientId : null
-  const other = target === 'red' ? 'blue' : 'red'
-  /* 坐席 + 脏数据自愈：若另一席残留着我的 clientId（异常历史 state），一并清掉 */
-  players.value = {
-    ...p,
-    [target]: { clientId: uid, name: target === 'red' ? '赤营' : '青营' },
-    [other]: p[other] && p[other].clientId === uid ? null : p[other],
-  }
-  syncState()
-  if (replacing) {
-    sendKick(oldCid) /* 瞬时踢人：DO 直接关掉对方残留的 ws（若有） */
-    flashTip(`原${target === 'red' ? '赤营' : '青营'}离线超过 3 分钟，你已顶替其席位。`, 'ok')
-  }
-}
-
 /* ================= 常量 ================= */
 const TEAM_NAME = { A: '赤营', B: '青营' }
 /* 阵营名：默认赤营/青营，双方可各自改名；状态条、提示、记录与导出图统一用它 */
@@ -633,9 +638,6 @@ const phaseText = computed(() => {
   if (gameState.phase === 'playing') return `进行中 · 轮到 ${teamNames.value[currentTeam.value]}`
   return '对战结束'
 })
-const startLabel = computed(() =>
-  gameState.phase === 'playing' ? '对战中' : gameState.phase === 'over' ? '已结束' : '开始对战'
-)
 const flyTurns = computed(() => gameState.log.filter((e) => e.type === 'fly').length)
 const flyLogs = computed(() => gameState.log.filter((e) => e.type === 'fly' || e.type === 'pass').slice().reverse())
 const resultFlies = computed(() => gameState.log.filter((e) => e.type === 'fly'))
@@ -1181,7 +1183,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
         <span class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
         <span style="color:#98a4b3;font-size:12px;margin-left:6px;font-weight:600">v2.4</span>
         <span v-if="roomState === 'playing'" class="conn room">房间 {{ roomCode }}</span>
-        <span v-if="roomState === 'playing'" class="conn room">你是{{ myTeam ? teamNames[myTeam] : '观战' }}</span>
+        <span v-if="roomState === 'playing'" class="conn room">你是{{ myTeam ? teamNames[myTeam] : '入席中…' }}</span>
         <template v-if="roomState === 'playing'">
           <label class="chk" title="开启后，点击棋盘格子可循环切换：无主 → 赤 → 青 → 无主">
             <input type="checkbox" v-model="fixMode" /> 修正模式
@@ -1198,10 +1200,10 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                    :disabled="gameState.phase === 'playing'" @change="onExtraChange" />
             <span>个额外字</span>
           </label>
-          <button :disabled="gameState.phase === 'playing'" @click="redrawOrAgain">{{ redrawLabel }}</button>
-          <button class="primary" :disabled="gameState.phase !== 'ready'" @click="startGame">{{ startLabel }}</button>
-          <button :disabled="!gameState.undoStack.length" @click="undo">撤销一步</button>
-          <button :disabled="gameState.phase !== 'playing'" @click="onFinish">结算</button>
+          <button v-if="gameState.phase !== 'playing'" @click="redrawOrAgain">{{ redrawLabel }}</button>
+          <button v-if="gameState.phase === 'ready'" class="primary" @click="startGame">开始对战</button>
+          <button v-if="gameState.phase === 'playing'" :disabled="!gameState.undoStack.length" @click="undo">撤销一步</button>
+          <button v-if="gameState.phase === 'playing'" @click="onFinish">结算</button>
           <button @click="exitRoom">退出房间</button>
         </template>
       </div>
@@ -1242,15 +1244,19 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
               第 <b>{{ currentRound }}</b> 轮 · <span>{{ phaseText }}</span>
             </div>
             <div class="teams">
-              <div class="team tA" :class="{ active: gameState.phase === 'playing' && currentTeam === 'A' }">
+              <div class="team tA" :class="{ active: gameState.phase === 'playing' && currentTeam === 'A', mine: myTeam === 'A', selectable: canSwitchSide }"
+                   :title="canSwitchSide ? '点击切换到赤营席位' : (myTeam === 'A' ? '你所在的阵营' : '')"
+                   @click="canSwitchSide && pickTeam('A')">
                 <span class="swatch"></span>{{ teamNames.A }} <span class="num">{{ score.a }}</span>
-                <button v-if="myTeam === 'B' && !redOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 3 分钟，点击移出；对方会被带回大厅" @click="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'B' && !redOnline" class="offbadge" title="超过 25 秒没有心跳">离线</span>
+                <button v-if="myTeam === 'B' && !redOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
+                <span v-else-if="myTeam === 'B' && !redOnline" class="offbadge" title="超过 1 分钟没有心跳">离线</span>
               </div>
-              <div class="team tB" :class="{ active: gameState.phase === 'playing' && currentTeam === 'B' }">
+              <div class="team tB" :class="{ active: gameState.phase === 'playing' && currentTeam === 'B', mine: myTeam === 'B', selectable: canSwitchSide }"
+                   :title="canSwitchSide ? '点击切换到青营席位' : (myTeam === 'B' ? '你所在的阵营' : '')"
+                   @click="canSwitchSide && pickTeam('B')">
                 <span class="swatch"></span>{{ teamNames.B }} <span class="num">{{ score.b }}</span>
-                <button v-if="myTeam === 'A' && !blueOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 3 分钟，点击移出；对方会被带回大厅" @click="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'A' && !blueOnline" class="offbadge" title="超过 25 秒没有心跳">离线</span>
+                <button v-if="myTeam === 'A' && !blueOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
+                <span v-else-if="myTeam === 'A' && !blueOnline" class="offbadge" title="超过 1 分钟没有心跳">离线</span>
               </div>
             </div>
           </div>
@@ -1308,7 +1314,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                 <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色。</li>
                 <li>合法性：本句命中棋盘的字中，<b>至少要有 1 个格子当前未填色</b>；命中已涂色格可以抢夺。若命中格全都是已有颜色，本句无效。</li>
                 <li>胜负：不限轮数，点「<b>结算</b>」随时结束本局，<b>己方颜色格子多者胜</b>；等同则平局。</li>
-                <li>离线：对方 <b>25 秒</b>无心跳即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；对方离线满 <b>3 分钟</b>，队名处出现「踢出」按钮（移出后对方回大厅），新成员加入时也可<b>顶替</b>其席位（双方离线时优先顶替离线更久者）；房主离线满 3 分钟，在席成员自动接管房主。双方都不在线满 24 小时的房间会被定时清理。</li>
+                <li>离线：对方超过 <b>1 分钟</b>无心跳即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；离线再满 1 分钟，队名处出现「<b>踢出</b>」按钮，可手动将其移出房间（不自动踢出）。踢出或被新人<b>顶替</b>后席位空出；若被移出者是房主，房主随之转让。新成员加入时自动顶替离线者（双方离线时优先顶替离线更久者）；赤青两席<b>都有人且在线</b>时不允许第三人加入。双方都不在线满 24 小时的房间会被清理。</li>
               </ol>
             </div>
           </details>
@@ -1343,8 +1349,6 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <div class="row" style="margin-top:10px">
               <button @click="onExportPng" title="生成当前局面战报图（含棋盘与飞花记录）并下载 PNG 文件，与旧版「导出战报」一致">导出战报</button>
               <button @click="onExportGif" title="生成逐手回放 GIF（从空盘到当前局面）并下载，记录越多耗时越久">导出 GIF</button>
-              <button v-if="canSwitchSide" @click="switchSide"
-                      title="房间只有自己时可换到另一阵营（赤 ⇄ 青）；房主身份跟人走，不受影响">切换阵营</button>
             </div>
             <div class="row" style="margin-top:10px" v-if="myTeam">
               <input type="text" v-model="teamNameInput" maxlength="12" style="flex:1;min-width:0"
@@ -1524,6 +1528,11 @@ button.offbadge:hover{background:#F6D9D6;}
 .team.tB .swatch{background:var(--ink-b);}
 .team.tA.active{border-color:var(--ink-a);color:var(--ink-a);background:#FCF0EE;box-shadow:0 0 0 4px rgba(194,53,42,.08);}
 .team.tB.active{border-color:var(--ink-b);color:var(--ink-b);background:#EDF4FB;box-shadow:0 0 0 4px rgba(30,111,184,.08);}
+/* 我所在阵营：全底色选中；房间只有自己时（selectable）可点击切换阵营 */
+.team.selectable{cursor:pointer;}
+.team.mine .swatch{box-shadow:0 0 0 2px rgba(255,255,255,.85);}
+.team.tA.mine{background:var(--ink-a);border-color:var(--ink-a);color:#fff;box-shadow:0 0 0 4px rgba(194,53,42,.10);}
+.team.tB.mine{background:var(--ink-b);border-color:var(--ink-b);color:#fff;box-shadow:0 0 0 4px rgba(30,111,184,.10);}
 .team .num{font-variant-numeric:tabular-nums;font-size:15px;}
 .scorebar{height:12px;border-radius:999px;overflow:hidden;display:flex;background:var(--blank);margin-top:12px;border:1px solid var(--line);}
 .scorebar span{display:block;height:100%;transition:width .35s cubic-bezier(.4,0,.2,1);}
