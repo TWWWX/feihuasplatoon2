@@ -1,7 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { connectWs, closeWs, sendRaw, sendKick, wsStatus, wsError } from './useWebSocket'
-import { POOL, POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
+import { POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
 import { exportShotPng, exportShotGif } from './game/exporter'
 
 /* ================= 连接状态（WebSocket → GameRoom；变量名沿用旧模板绑定） =================
@@ -164,8 +164,6 @@ function localToCloudState() {
     totalRounds: 0,
     endless: true,
     poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0),
-    poolRemoved: gameState.poolRemoved || '',
-    poolAdded: gameState.poolAdded || '',
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -192,8 +190,6 @@ function cloudToLocalState(st) {
     totalRounds: 0,
     endless: true,
     poolMask: typeof st.poolMask === 'number' ? st.poolMask : 511,
-    poolRemoved: typeof st.poolRemoved === 'string' ? st.poolRemoved : '',
-    poolAdded: typeof st.poolAdded === 'string' ? st.poolAdded : '',
     board: (st.board || []).map((c) => ({
       ch: c.ch,
       owner: c.owner === 'red' ? 'A' : c.owner === 'blue' ? 'B' : null,
@@ -226,8 +222,6 @@ function applyRoomSnapshot(st) {
   gameState.totalRounds = local.totalRounds
   gameState.endless = local.endless
   applyPoolMask(local.poolMask)
-  gameState.poolRemoved = local.poolRemoved
-  gameState.poolAdded = local.poolAdded
   gameState.board = local.board
   gameState.turnNo = local.turnNo
   gameState.log = local.log
@@ -696,8 +690,6 @@ const gameState = reactive({
   totalRounds: 0, // 固定 0（保留字段兼容旧存档同步协议，不再使用）
   endless: true,
   turnNo: 1, // 1-based 总出手次数
-  poolRemoved: '', // 手动换字：从基础字库移除的字（与 poolAdded 数量守恒）
-  poolAdded: '', // 手动换字：从额外字池补入的字
   log: [], // 飞花 / 放弃记录
   undoStack: [],
 })
@@ -757,37 +749,6 @@ const activePool = computed(() => {
   return out
 })
 const activePoolSet = computed(() => new Set(activePool.value))
-/* 手动换字：点字库字块取消/恢复（poolRemoved）、点未入选字补位（poolAdded）。
-   不重抽棋盘——改动即时进入生效字库，下一次重抽/再来一局才铺新字；
-   守恒约束：补入数 ≤ 移除数，两者相等（含 0=0）才能开局。 */
-const removedSet = computed(() => new Set(Array.from(gameState.poolRemoved)))
-const addedSet = computed(() => new Set(Array.from(gameState.poolAdded)))
-const removedArr = computed(() => Array.from(gameState.poolRemoved))
-const addedArr = computed(() => Array.from(gameState.poolAdded))
-const effectivePool = computed(() => {
-  const rm = removedSet.value
-  const out = activePool.value.filter((ch) => !rm.has(ch))
-  for (const ch of gameState.poolAdded) if (!rm.has(ch)) out.push(ch)
-  return out
-})
-const effectivePoolSet = computed(() => new Set(effectivePool.value))
-function onPoolCharClick(ch) {
-  if (gameState.phase !== 'ready') return
-  if (removedSet.value.has(ch)) {
-    gameState.poolRemoved = gameState.poolRemoved.replace(ch, '')
-  } else if (addedSet.value.has(ch)) {
-    gameState.poolAdded = gameState.poolAdded.replace(ch, '')
-  } else if (activePoolSet.value.has(ch)) {
-    gameState.poolRemoved += ch /* 取消选中：该字退出下一次抽盘 */
-  } else {
-    if (addedArr.value.length >= removedArr.value.length) {
-      flashTip('需先取消选中一个字，才能选入别的字（两者数量要相等才能开局）。', 'warn')
-      return
-    }
-    gameState.poolAdded += ch /* 选入别的未被选中的字补位 */
-  }
-  syncState()
-}
 const extraAvail = computed(() => EXTRA.reduce((n, ch) => (activePoolSet.value.has(ch) ? n : n + 1), 0))
 function togglePool(key) {
   if (gameState.phase !== 'ready') return
@@ -857,9 +818,8 @@ const poolOn = computed(() => {
   return m
 })
 const extraOnBoard = computed(() => {
-  /* 不在生效字库、且不是刚被手动移除的基础字（本局仍留在棋盘上）→ 视为额外字 */
-  const sel = effectivePoolSet.value
-  const ex = gameState.board.filter((c) => !sel.has(c.ch) && !removedSet.value.has(c.ch)).map((c) => c.ch)
+  const sel = activePoolSet.value
+  const ex = gameState.board.filter((c) => !sel.has(c.ch)).map((c) => c.ch)
   ex.sort((x, y) => (EXTRA_FREQ[y] || 0) - (EXTRA_FREQ[x] || 0))
   return ex
 })
@@ -910,9 +870,10 @@ function redrawBoard(seed = Math.floor(Math.random() * 2 ** 31)) {
   const extraN = Math.max(0, Math.min(cap, parseInt(extraInput.value, 10) || 0))
   extraInput.value = extraN
   gameState.seed = seed
-  gameState.board = buildBoard(seed, gameState.side, extraN, effectivePool.value)
+  gameState.board = buildBoard(seed, gameState.side, extraN, activePool.value)
   previewSet.value = new Set()
   changedNow.value = {}
+  removedCells.value = new Set() /* 重抽即重开选字 */
 }
 
 /* ================= 导出（战报截图 / 逐手回放 GIF） ================= */
@@ -936,6 +897,33 @@ const onExportGif = () => exportShotGif(exportGameCtx(), flashTip)
 /* 出手前预览：输入句命中的格子刷成己方阵营的半透明色（对方回合也可作草稿预览） */
 const poemInput = ref('')
 const previewSet = ref(new Set())
+/* 选字环节（ready）：点击棋盘字取消（格标记 cut），再点字库字补位；取消与补位相等（棋盘无空缺）才能开局。
+   只改当前这一盘的 board，不碰字库池、不重抽；重抽/再来一局自动重置。 */
+const removedCells = ref(new Set())
+function toggleRemovedCell(idx) {
+  const s = new Set(removedCells.value)
+  if (s.has(idx)) s.delete(idx)
+  else s.add(idx)
+  removedCells.value = s
+}
+function onPoolSwapPick(ch) {
+  if (gameState.phase !== 'ready') return
+  if (!removedCells.value.size) {
+    flashTip('先在棋盘上点击要换掉的字（取消选中），再来字库里点新字补位。', 'warn')
+    return
+  }
+  if (poolOn.value[ch]) {
+    flashTip(`「${ch}」已在棋盘上，换字不能产生重复字。`, 'warn')
+    return
+  }
+  const idx = [...removedCells.value][0]
+  gameState.board[idx].ch = ch
+  const s = new Set(removedCells.value)
+  s.delete(idx)
+  removedCells.value = s
+  syncState()
+  flashTip(`已用「${ch}」补位，还可换 ${s.size} 个字。`, 'ok')
+}
 /* 输入锁定：仅未开局 / 已结束时锁（对局中对方回合也可打草稿，但提交按钮仍锁定） */
 const poemLocked = computed(() => gameState.phase !== 'playing')
 const poemPlaceholder = computed(() => {
@@ -993,6 +981,7 @@ function cellClass(i) {
     else cls.push('pv-hold')
   }
   if (fixMode.value) cls.push('fixable')
+  if (removedCells.value.has(i)) cls.push('cut')
   if (changedNow.value[i]) cls.push('flash')
   const hideR = col === side - 1 || (token !== 'blank' && colorToken(i + 1) === token)
   const hideB = row === side - 1 || (token !== 'blank' && colorToken(i + side) === token)
@@ -1003,6 +992,11 @@ function cellClass(i) {
 
 /* 修正模式：点击格子循环切换 无主 → 赤 → 青 → 无主 */
 function onCellClick(idx) {
+  /* 选字环节：点棋盘字 = 取消/恢复（换字模式），与修正模式互斥 */
+  if (gameState.phase === 'ready') {
+    if (!fixMode.value) toggleRemovedCell(idx)
+    return
+  }
   if (!fixMode.value) return
   const order = [null, 'A', 'B']
   const cur = gameState.board[idx].owner
@@ -1295,8 +1289,8 @@ function redrawOrAgain() {
 const redrawLabel = computed(() => (gameState.phase === 'over' ? '再来一局' : '重抽棋盘'))
 function startGame() {
   if (gameState.phase === 'playing') return
-  if (removedArr.value.length !== addedArr.value.length) {
-    flashTip(`换字未完成：已移除 ${removedArr.value.length} 字、已补入 ${addedArr.value.length} 字，两者相等（含 0=0）才能开局。`, 'err')
+  if (removedCells.value.size) {
+    flashTip(`还有 ${removedCells.value.size} 个被取消的棋盘字未补位：在下方字库点字补齐，或再次点击棋盘字恢复。`, 'err')
     return
   }
   /* 改了尺寸但没触发 change：先按新尺寸重铺，否则会拿旧棋盘开局 */
@@ -1518,12 +1512,11 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                         @click="selectAllPools" title="七个字库全部参与（默认）">全选</button>
               </div>
               <div class="poolgrid swap">
-                <span v-for="ch in POOL" :key="ch"
-                      :class="{ on: poolOn[ch], cut: removedSet.has(ch), cand: addedSet.has(ch), off: !activePoolSet.has(ch) && !addedSet.has(ch) }"
-                      :title="removedSet.has(ch) ? '点击恢复该字' : addedSet.has(ch) ? '点击取消选入' : activePoolSet.has(ch) ? '点击取消选中（退出下一次抽盘）' : '点击选入（补位，需先取消选中一个字）'"
-                      @click="onPoolCharClick(ch)">{{ ch }}</span>
+                <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] }"
+                      title="点击用该字补位棋盘上被取消的字（该字不能已在棋盘上）"
+                      @click="onPoolSwapPick(ch)">{{ ch }}</span>
               </div>
-              <p class="poolnote">选字：点击字块可取消选中 / 再选入补位（数量须相等才能开局）；改动不重抽当前棋盘，下次重抽生效。当前移除 {{ removedArr.length }} 字 · 选入 {{ addedArr.length }} 字{{ removedArr.length === addedArr.length ? ' · 可开局' : ' · 未守恒' }}。</p>
+              <p class="poolnote">勾选的字库集合取并集去重后构成基础字库。开局前可换字：先点棋盘上不要的字（取消选中，再点恢复），再在这里点新字补位；取消与补位数量相等（棋盘无空缺）才能开局。换字只影响本盘，重抽/再来一局会重铺。</p>
             </div>
           </details>
           <details>
@@ -1747,9 +1740,7 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .row.center{justify-content:center;}
 .poolgrid.swap span{cursor:pointer;user-select:none;transition:.12s;}
 .poolgrid.swap span:hover{transform:scale(1.12);}
-.poolgrid.swap span.off{opacity:.45;}
-.poolgrid.swap span.cut{opacity:.4;text-decoration:line-through;background:#FBEDEA;border-color:#F0C7C4;}
-.poolgrid.swap span.cand{color:#8A5A0B;background:#FFF9EE;border-color:#EFE0C0;}
+.cell.cut{opacity:.35;text-decoration:line-through;outline:2px dashed #D98A80;outline-offset:-3px;}
 .ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
 .ghost-del:hover{background:#FBEDEA;}
 .recent-row{display:flex;align-items:center;gap:10px;padding:6px 0;}
