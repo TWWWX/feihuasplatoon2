@@ -935,6 +935,12 @@ function onPoolSwapPick(ch) {
   syncState()
   flashTip(`已用「${ch}」补位，还可换 ${s.size} 个字。`, 'ok')
 }
+/* 额外字面板：额外字必在棋盘上，点击 = 取消/恢复（补位仍走基础字库） */
+function onExtraSwapPick(ch) {
+  if (gameState.phase !== 'ready') return
+  const idx = gameState.board.findIndex((c) => c.ch === ch)
+  if (idx >= 0) toggleRemovedCell(idx)
+}
 /* 输入锁定：仅未开局 / 已结束时锁（对局中对方回合也可打草稿，但提交按钮仍锁定） */
 const poemLocked = computed(() => gameState.phase !== 'playing')
 const poemPlaceholder = computed(() => {
@@ -1514,7 +1520,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           </div>
 
           <details>
-            <summary>基础字库（{{ activePool.length }} 字 · 七库并集）</summary>
+            <summary>基础字库（{{ activePool.length }} 字）</summary>
             <div class="detbody">
               <div class="poolpick" :title="gameState.phase === 'ready' ? '勾选参与抽样的字库集合（并集去重）；随房间同步双方' : '仅待开局时可调整'">
                 <button v-for="opt in POOL_OPTIONS" :key="opt.key" :class="{ on: poolSel[opt.key] }"
@@ -1534,10 +1540,12 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <summary>{{ extraOnBoard.length ? `额外字（本局 ${extraOnBoard.length} 个）` : `额外字（本局未启用 · 共 ${extraAvail} 字可选）` }}</summary>
             <div class="detbody">
               <div class="poolgrid">
-                <span v-for="ch in extraOnBoard" :key="ch" class="on" :title="`唐诗+宋词出现 ${EXTRA_FREQ[ch] || 0} 次`">{{ ch }}</span>
+                <span v-for="ch in extraOnBoard" :key="ch" :class="{ on: !removedChars.has(ch) }"
+                      :title="removedChars.has(ch) ? '已取消，点击恢复' : `点击取消该字 · 全库正文出现 ${EXTRA_FREQ[ch] || 0} 次`"
+                      @click="onExtraSwapPick(ch)">{{ ch }}</span>
               </div>
               <p v-if="!extraOnBoard.length" class="poolnote">
-                本局未启用额外字。在顶栏「额外字」填一个数字，就能让其中若干格改从<b>额外字池</b>里抽（按唐诗+宋词合计频次加权，自动避开已选基础字库）。
+                本局未启用额外字。在顶栏「额外字」填一个数字，就能让其中若干格改从<b>额外字池</b>里抽（按全部诗文正文频次加权，自动避开已选基础字库）。
               </p>
             </div>
           </details>
