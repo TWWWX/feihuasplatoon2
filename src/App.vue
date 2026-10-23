@@ -152,7 +152,7 @@ function localToCloudState() {
     side: gameState.side,
     totalRounds: 0,
     endless: true,
-    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0),
+    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0),
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -178,7 +178,7 @@ function cloudToLocalState(st) {
     side: st.side || Math.round(Math.sqrt((st.board || []).length)) || 10,
     totalRounds: 0,
     endless: true,
-    poolMask: typeof st.poolMask === 'number' ? st.poolMask : 127,
+    poolMask: typeof st.poolMask === 'number' ? st.poolMask : 511,
     board: (st.board || []).map((c) => ({
       ch: c.ch,
       owner: c.owner === 'red' ? 'A' : c.owner === 'blue' ? 'B' : null,
@@ -526,7 +526,7 @@ const gameState = reactive({
   side: 10,
   board: [], // [{ ch, owner: null | 'A' | 'B' }]
   phase: 'ready', // ready | playing | over
-  totalRounds: 0, // 固定 0：战至最后一刻（保留字段兼容旧存档）
+  totalRounds: 0, // 固定 0（保留字段兼容旧存档同步协议，不再使用）
   endless: true,
   turnNo: 1, // 1-based 总出手次数
   log: [], // 飞花 / 放弃记录
@@ -545,12 +545,14 @@ const POOL_OPTIONS = [
   { key: 'tang', label: '全唐诗 300' },
   { key: 'song', label: '全宋词 300' },
   { key: 'songx', label: '宋词 300（不含唐诗字）' },
-  { key: 'su', label: '苏轼 300' },
-  { key: 'su2', label: '苏轼 301–600' },
-  { key: 'xin', label: '辛弃疾 300' },
-  { key: 'xin2', label: '辛弃疾 301–600' },
+  { key: 'su', label: '苏轼词 1–200' },
+  { key: 'su2', label: '苏轼词 201–400' },
+  { key: 'su3', label: '苏轼词 401–600' },
+  { key: 'xin', label: '辛弃疾词 1–200' },
+  { key: 'xin2', label: '辛弃疾词 201–400' },
+  { key: 'xin3', label: '辛弃疾词 401–600' },
 ]
-const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, xin: true, xin2: true }) // 默认全选
+const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true }) // 默认全选
 const activePool = computed(() => {
   const out = []
   const seen = new Set()
@@ -577,13 +579,14 @@ function togglePool(key) {
 }
 function selectAllPools() {
   if (gameState.phase !== 'ready') return
-  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, xin: true, xin2: true }
+  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true }
   redrawBoard()
   syncState()
 }
 function applyPoolMask(mask) {
-  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64；旧对局(0-15)无新位，解析为未勾，可手动补选 */
-  const m = typeof mask === 'number' && mask >= 0 && mask <= 127 ? mask : 127
+  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256；
+     旧对局(0-127)无 su3/xin3 位，解析为未勾，可手动补选 */
+  const m = typeof mask === 'number' && mask >= 0 && mask <= 511 ? mask : 511
   poolSel.value = {
     tang: !!(m & 1),
     song: !!(m & 2),
@@ -592,6 +595,8 @@ function applyPoolMask(mask) {
     songx: !!(m & 16),
     su2: !!(m & 32),
     xin2: !!(m & 64),
+    su3: !!(m & 128),
+    xin3: !!(m & 256),
   }
 }
 
@@ -943,11 +948,6 @@ function advance() {
   poemInput.value = ''
   updatePreview()
   gameState.turnNo++
-  /* 棋盘填满：立即结算 */
-  if (score.value.n === 0) {
-    finish('棋盘已填满')
-    return
-  }
   focusPoem()
 }
 
@@ -1012,13 +1012,7 @@ const resultInfo = computed(() => {
   } else {
     win = '平局'; name = `${teamNames.value.A} ${c.a} : ${c.b} ${teamNames.value.B}`; color = '#5B6B84'
   }
-  const label =
-    '对战结束 · ' +
-    (finishReason.value === '棋盘已填满'
-      ? '棋盘已填满 · 涂色面积结算'
-      : gameState.endless
-        ? `战至最后一刻 · ${finishReason.value || '手动结算'}`
-        : `${gameState.totalRounds} 轮 · 涂色面积结算`)
+  const label = `对战结束 · ${finishReason.value || '手动结算'}`
   return { win, name, color, label }
 })
 function flyCount(team) {
@@ -1067,6 +1061,12 @@ function onRedraw() {
   syncState()
   flashTip(`已重新抽取 ${cellTotal.value} 字棋盘（${gameState.side}×${gameState.side}${k ? `，含额外字 ${k}` : ''}），随时可以开局。`, 'ok')
 }
+/* 顶栏按钮：对局结束后 = 再来一局（重抽并回到开局态）；其余 = 重抽棋盘 */
+function redrawOrAgain() {
+  if (gameState.phase === 'over') again()
+  else onRedraw()
+}
+const redrawLabel = computed(() => (gameState.phase === 'over' ? '再来一局' : '重抽棋盘'))
 function startGame() {
   if (gameState.phase === 'playing') return
   /* 改了尺寸但没触发 change：先按新尺寸重铺，否则会拿旧棋盘开局 */
@@ -1081,7 +1081,7 @@ function startGame() {
   gameState.undoStack = []
   previewSet.value = new Set()
   flashTip(
-    '开局（战至最后一刻）！由 ' + teamNames.value.A + ' 先飞。棋盘填满或点「提前结算」时结算。',
+    '开局！由 ' + teamNames.value.A + ' 先飞。点「结算」随时结束本局并计算胜负。',
     'ok'
   )
   focusPoem()
@@ -1112,7 +1112,7 @@ function onExtraChange() {
   flashTip(k ? `已重铺棋盘：其中 ${k} 个额外字（按唐诗+宋词合计频次加权抽取）。` : '已重铺棋盘：只用基础字库（当前勾选集合）。', 'ok')
 }
 function onFinish() {
-  if (confirm('确认提前结算？')) {
+  if (confirm('确认结算？')) {
     finish()
     syncState()
   }
@@ -1142,7 +1142,7 @@ function onPoemMousedown(e) {
 }
 function lockHint() {
   if (gameState.phase === 'over') {
-    flashTip('本局已结束。点结算面板里的「再来一局」，或用「重抽棋盘」开新的一局。', 'warn')
+    flashTip('本局已结束。点顶栏「再来一局」或结算面板里的「再来一局」开新的一局。', 'warn')
   } else {
     flashTip('输入框还没解锁——请先点上方「开始对战」，之后即可输入诗句。', 'warn')
   }
@@ -1191,10 +1191,10 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                    :disabled="gameState.phase === 'playing'" @change="onExtraChange" />
             <span>个额外字</span>
           </label>
-          <button :disabled="gameState.phase === 'playing'" @click="onRedraw">重抽棋盘</button>
+          <button :disabled="gameState.phase === 'playing'" @click="redrawOrAgain">{{ redrawLabel }}</button>
           <button class="primary" :disabled="gameState.phase !== 'ready'" @click="startGame">{{ startLabel }}</button>
           <button :disabled="!gameState.undoStack.length" @click="undo">撤销一步</button>
-          <button :disabled="gameState.phase !== 'playing'" @click="onFinish">提前结算</button>
+          <button :disabled="gameState.phase !== 'playing'" @click="onFinish">结算</button>
           <button @click="exitRoom">退出房间</button>
         </template>
       </div>
@@ -1232,7 +1232,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
         <div class="card">
           <div class="pad turnbar">
             <div class="roundinfo">
-              第 <b>{{ currentRound }}</b> 轮 · 战至最后一刻 · <span>{{ phaseText }}</span>
+              第 <b>{{ currentRound }}</b> 轮 · <span>{{ phaseText }}</span>
             </div>
             <div class="teams">
               <div class="team tA" :class="{ active: gameState.phase === 'playing' && currentTeam === 'A' }">
@@ -1297,10 +1297,10 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <summary>规则与判定逻辑</summary>
             <div class="detbody">
               <ol class="rules">
-                <li>棋盘：从<b>基础字库</b>（默认为「全唐诗 300 + 全宋词 300 + 宋词 300·不含唐诗字 + 苏轼 300 + 苏轼 301–600 + 辛弃疾 300 + 辛弃疾 301–600」七库并集去重，可在「基础字库」面板勾选参与集合）中<b>随机抽 N×N 个不重复的字</b>铺成方阵（N 可在顶栏设 5–20）。顶栏「<b>额外字</b>」可指定其中 K 格改从<b>额外字池</b>（自动避开已选基础字库）里抽 —— 抽取<b>按唐诗与宋词合计频次加权</b>，越常见的字越容易被抽中。</li>
+                <li>棋盘：从<b>基础字库</b>（默认为「全唐诗 300 + 全宋词 300 + 宋词 300·不含唐诗字 + 苏轼词 1–200 / 201–400 / 401–600 + 辛弃疾词 1–200 / 201–400 / 401–600」九库并集去重，可在「基础字库」面板勾选参与集合）中<b>随机抽 N×N 个不重复的字</b>铺成方阵（N 可在顶栏设 5–20）。顶栏「<b>额外字</b>」可指定其中 K 格改从<b>额外字池</b>（自动避开已选基础字库）里抽 —— 抽取<b>按唐诗与宋词合计频次加权</b>，越常见的字越容易被抽中。</li>
                 <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色。</li>
                 <li>合法性：本句命中棋盘的字中，<b>至少要有 1 个格子当前未填色</b>；命中已涂色格可以抢夺。若命中格全都是已有颜色，本句无效。</li>
-                <li>胜负：本局为「<b>战至最后一刻</b>」模式——不限轮数，<b>棋盘填满</b>或点「<b>提前结算</b>」才结算，<b>己方颜色格子多者胜</b>；等同则平局。</li>
+                <li>胜负：不限轮数，点「<b>结算</b>」随时结束本局，<b>己方颜色格子多者胜</b>；等同则平局。</li>
                 <li>离线：对方 <b>25 秒</b>无心跳即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；对方离线满 <b>3 分钟</b>，队名处出现「踢出」按钮（移出后对方回大厅），新成员加入时也可<b>顶替</b>其席位（双方离线时优先顶替离线更久者）；房主离线满 3 分钟，在席成员自动接管房主。双方都不在线满 24 小时的房间会被定时清理。</li>
               </ol>
             </div>
