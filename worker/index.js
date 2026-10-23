@@ -1,17 +1,19 @@
-/* 飞花实时转发 Worker：GameRoom Durable Object（方案 B 纯转发器）
+/* 飞花实时转发 Worker：GameRoom Durable Object（方案 B 纯转发器，100% 事件驱动）
    - /ws?roomId=xxx → env.ROOMS.idFromName(roomId) 路由到对应 GameRoom
    - 游戏消息（前端 gameState JSON 字符串）原样广播给房间内其他连接，异步持久化到 DO storage + D1
    - 控制消息（不广播、不落库，绝不阻塞游戏消息转发）：
-       __ping                              → 回 __pong（移动端假死保活 + lastSeen 刷新）
-       {"__hello": "<clientId>"}           → 登记身份到连接附件，回 __pong
-       __who                               → 回 {__who:[{clientId,lastSeen,self}]}（仅发给请求者）
-       {"type":"kick","targetClientId"}    → 在连接池找到目标 ws 立即 close(4001,'被踢出房间')；找不到（已离线）则忽略
-   - webSocketClose：给剩余连接广播 {__peer_closed:{code}}，对端 UI 立即显示离线/被踢
-   - 满员策略：已有 2 个连接且全部活跃（心跳 <75s）时拒绝第三人；存在静默超 75s 的连接则放行第三人，
-     被顶替者由前端业务层按 clientId 精确 sendKick（DO 不解析席位归属）
+       {"__hello": "<clientId>"}         → 登记身份到连接附件；给新连接发 {type:'peers'} 成员快照，
+                                           并向老成员广播 {type:'peer_online', clientId}
+       {"type":"kick","targetClientId"}  → 找到目标 ws 立即 close(4001,'被踢出房间')；找不到（已离线）则忽略
+   - 在线/离线事件（替代旧 __ping/__who 轮询）：
+       上线：__hello 登记 → 广播 peer_online
+       离线：webSocketClose → 记录离线时间（offlineLog）→ 广播 {type:'peer_offline', clientId, code}
+       初次同步：新连接在 __hello 时收到 peers 快照（在线者 + 离线者及其离线时间）
+   - 满员策略：无硬性满员拒绝（连接数上限 3 防滥用），「房间满/顶替离线者」由前端业务层按
+     peers 快照判定（ensureSeat），被顶替者由前端 sendKick 精确关闭（DO 不解析席位归属）
    - 房间回收：state 超 24 小时未更新（双方均离线超过 24h）→ 清空 storage + D1，房间视为不存在
    持久化说明：storage.put 为权威副本（hibernate 唤醒用）；D1 rooms 表为备份/审计，恢复时仅作回退。 */
-const STALE_MS = 75 * 1000 /* 静默 75s（心跳 60s + 容差）的连接视为离线，可被第三人顶替 */
+const MAX_CONNECTIONS = 3 /* 硬上限（两名玩家 + 顶替中连接），防滥用 */
 const ROOM_TTL = 24 * 60 * 60 * 1000 /* state 超过 24h 未更新 → 房间回收 */
 
 export class GameRoom {
@@ -19,6 +21,8 @@ export class GameRoom {
     this.state = state
     this.env = env
     this.roomId = null
+    this.offlineLog = new Map() /* clientId → offlineAt（内存缓存，storage 持久化；hibernate 唤醒后惰性恢复） */
+    this.offlineLoaded = false
   }
 
   async fetch(request) {
@@ -33,28 +37,22 @@ export class GameRoom {
   }
 
   async handleSession(server) {
-    const sockets = this.state.getWebSockets()
     const now = Date.now()
 
-    /* 满员判定：两个连接都活跃 → 拒绝第三人；存在静默超 75s 的连接 → 放行，
-       被顶替者由前端业务层 sendKick（按 clientId 精确关闭） */
-    if (sockets.length >= 2) {
-      const hasStale = sockets.some((s) => {
-        const meta = readMeta(s)
-        return !meta || now - meta.lastSeen > STALE_MS
-      })
-      if (!hasStale) {
-        server.accept()
-        server.close(4001, '房间已满（赤青两营均有玩家且都在线）')
-        return
-      }
+    /* 连接数硬上限：正常业务最多 2 个玩家连接，留 1 个余量给顶替场景 */
+    if (this.state.getWebSockets().length >= MAX_CONNECTIONS) {
+      server.accept()
+      server.close(4001, '连接数已达上限')
+      return
     }
+
+    /* roomId 兜底 + offlineLog 恢复：hibernate 唤醒后构造器重跑、内存丢失 */
+    if (this.roomId) await this.state.storage.put('room_id', this.roomId)
+    await this.ensureOfflineLog()
 
     /* Hibernation 模式：只允许 state.acceptWebSocket()，不能再手动 accept()（二者互斥） */
     this.state.acceptWebSocket(server)
-    server.serializeAttachment({ joinedAt: now, lastSeen: now, clientId: null })
-    /* roomId 兜底：hibernate 唤醒后构造器重跑、this.roomId 为空，从 storage 恢复 */
-    if (this.roomId) await this.state.storage.put('room_id', this.roomId)
+    server.serializeAttachment({ joinedAt: now, clientId: null })
 
     /* 状态恢复：最近一次保存的 gameState 直接发给新连接的玩家；
        state 超 24h 未更新（双方均离线超 24h）→ 清掉旧局，房间视为不存在 */
@@ -86,17 +84,8 @@ export class GameRoom {
 
   async webSocketMessage(ws, message) {
     if (typeof message !== 'string' || !message) return
-    touchMeta(ws)
 
     /* ---- 控制消息：同步处理，无持久化，不阻塞游戏消息 ---- */
-    if (message === '__ping') {
-      ws.send('__pong')
-      return
-    }
-    if (message === '__who') {
-      ws.send(JSON.stringify({ __who: this.listPeers(ws), at: Date.now() }))
-      return
-    }
     if (message[0] === '{') {
       let ctrl = null
       try {
@@ -108,12 +97,40 @@ export class GameRoom {
         const meta = readMeta(ws) || {}
         meta.clientId = String(ctrl.__hello)
         ws.serializeAttachment(meta)
-        ws.send('__pong')
+        await this.ensureOfflineLog()
+        this.offlineLog.delete(meta.clientId) /* 回归者清掉离线记录 */
+        persistOfflineLog(this)
+        /* 初始成员快照（替代旧 __who 轮询）：在线者 = 池内其他连接；离线者 = offlineLog */
+        const onlineIds = new Set()
+        const list = []
+        for (const s of this.state.getWebSockets()) {
+          if (s === ws) continue
+          const m = readMeta(s) || {}
+          if (m.clientId) {
+            onlineIds.add(m.clientId)
+            list.push({ clientId: m.clientId, online: true })
+          }
+        }
+        for (const [cid, at] of this.offlineLog) {
+          if (!onlineIds.has(cid)) list.push({ clientId: cid, online: false, offlineAt: at })
+        }
+        try {
+          ws.send(JSON.stringify({ type: 'peers', list, at: Date.now() }))
+        } catch {}
+        /* 向老成员广播新人上线 */
+        const note = JSON.stringify({ type: 'peer_online', clientId: meta.clientId })
+        for (const other of this.state.getWebSockets()) {
+          if (other !== ws) {
+            try {
+              other.send(note)
+            } catch {}
+          }
+        }
         return
       }
       if (ctrl && ctrl.type === 'kick') {
         /* 瞬时踢人：连接池里找到目标 ws 立即关闭；目标离线（无 ws）则忽略，
-           席位清理由前端走 state（players 移除该 clientId）完成 */
+           close 事件随后触发 webSocketClose → 广播 peer_offline（含 4001 code） */
         const target = this.state
           .getWebSockets()
           .find((s) => (readMeta(s) || {}).clientId === ctrl.targetClientId)
@@ -136,8 +153,13 @@ export class GameRoom {
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
-    /* sessions 广播：让对端立刻知道有人掉线（区分被踢 4001 / 顶替 4000 / 普通断开） */
-    const note = JSON.stringify({ __peer_closed: { code, at: Date.now() } })
+    /* 记录离线时间（双离线顶替时比较「谁离线更久」用）并广播对端离线 */
+    const meta = readMeta(ws) || {}
+    if (meta.clientId) {
+      this.offlineLog.set(meta.clientId, Date.now())
+      persistOfflineLog(this)
+    }
+    const note = JSON.stringify({ type: 'peer_offline', clientId: meta.clientId || null, code })
     for (const other of this.state.getWebSockets()) {
       if (other !== ws) {
         try {
@@ -151,11 +173,13 @@ export class GameRoom {
     /* 忽略：close 事件会随后到来 */
   }
 
-  listPeers(self) {
-    return this.state.getWebSockets().map((s) => {
-      const m = readMeta(s) || {}
-      return { clientId: m.clientId || null, lastSeen: m.lastSeen || 0, self: s === self }
-    })
+  async ensureOfflineLog() {
+    if (this.offlineLoaded) return
+    this.offlineLoaded = true
+    try {
+      const saved = await this.state.storage.get('offline_log')
+      if (saved) for (const [cid, at] of saved) if (!this.offlineLog.has(cid)) this.offlineLog.set(cid, at)
+    } catch {}
   }
 
   async persist(message) {
@@ -187,12 +211,8 @@ function readMeta(s) {
     return null
   }
 }
-function touchMeta(ws) {
-  try {
-    const m = readMeta(ws) || {}
-    m.lastSeen = Date.now()
-    ws.serializeAttachment(m)
-  } catch {}
+function persistOfflineLog(room) {
+  room.state.storage.put('offline_log', [...room.offlineLog.entries()]).catch(() => {})
 }
 
 /* ---- 入口：按 roomId 路由到对应 GameRoom 实例 ---- */

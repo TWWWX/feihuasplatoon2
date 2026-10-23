@@ -58,13 +58,15 @@ const myTeam = computed(() => {
   if (p.blue?.clientId === uid) return 'B'
   return null
 })
-/* 在线状态：来自 DO 的 __who（clientId + lastSeen），由 useWebSocket 每 15s 轮询。
+/* 在线状态：100% 事件驱动（无轮询）。
+   - peers 快照：连接建立后由 DO 发一次（在线者 + 离线者及其离线时间）
+   - peer_online / peer_offline：DO 在 __hello / webSocketClose 时推送
    对方离线只做「标记」，不暂停对战：对方离线时仍可正常提交（同步不依赖对方在线）。 */
 const redOnline = ref(true)
 const blueOnline = ref(true)
-const peerKickable = ref(false) /* 对方离线满 1 分钟（离线 70s 再持续 60s）：徽标变踢出按钮 */
+const peerKickable = ref(false) /* 对方离线满 1 分钟：徽标变踢出按钮（离线满 1 分钟时由一次性定时器点亮） */
 const gotRoomSnapshot = ref(false)
-/* 对方席位离线（70 秒无心跳）：显示横幅与徽标；离线满 1 分钟徽标变踢出按钮（手动踢），也可被新成员顶替 */
+/* 对方席位离线：显示横幅与徽标；离线满 1 分钟徽标变踢出按钮（手动踢），也可被新成员顶替 */
 const peerOffline = computed(
   () =>
     roomState.value === 'playing' &&
@@ -85,7 +87,6 @@ function kickPeer() {
   }
   players.value = { ...p, [seat]: null }
   syncState()
-  sendRaw('__who') /* 立即刷新在线状态，不等 15s 轮询 */
   flashTip('对方席位已空出。', 'ok')
 }
 /* 回合锁：只有轮到自己阵营时才能出牌（观战身份不能出牌） */
@@ -236,56 +237,88 @@ function syncState() {
   sendRaw(JSON.stringify(localToCloudState()))
 }
 
-/* ---- 在线状态（由 DO __who 驱动，useWebSocket 每 15s 拉一次） ----
+/* ---- 在线状态（事件驱动：peers 快照 + peer_online/peer_offline 推送） ----
    席位规则：对方离线只做标记，不自动移除；手动踢出、被新人顶替均即时生效。
-   阈值：离线判定 70s（心跳 60s + 容差）；离线满 1 分钟（累计 130s）出现「踢出」按钮。 */
-let lastPeers = []
-let whoSeen = false /* 已收到过至少一次 __who：ensureSeat 的前置条件（防快照先到时 lastPeers 为空误判） */
+   踢出按钮：对方离线满 1 分钟出现（离线时刻由 DO 事件提供）。 */
+let peersInfo = {} /* { [clientId]: { online, offlineAt } }：事件驱动的成员在线状态 */
+let peersSeen = false /* 已收到过 peers 快照：ensureSeat 的前置条件（防状态未同步时误判顶替） */
+let kickTimer = null /* 「离线满 1 分钟」点亮踢出按钮的一次性定时器 */
 function seatOf(cid) {
   const p = players.value || {}
   if (p.red && p.red.clientId === cid) return 'red'
   if (p.blue && p.blue.clientId === cid) return 'blue'
   return null
 }
-function onWho(peers, at) {
-  lastPeers = peers || []
-  whoSeen = true
-  const now = at || Date.now()
-  const lastSeen = (cid) => {
-    const peer = lastPeers.find((x) => x.clientId === cid)
-    return peer ? peer.lastSeen || 0 : 0 /* 不在连接池 = 已彻底离线，视为最久 */
+/* peers 快照（连接建立后 DO 发一次，重连也会重发）：整体覆盖成员在线状态 */
+function onPeers(list) {
+  const next = {}
+  for (const it of list || []) {
+    if (!it || !it.clientId) continue
+    next[it.clientId] = { online: !!it.online, offlineAt: it.offlineAt || 0 }
   }
-  const fresh = (cid) => now - lastSeen(cid) < 70000 /* 心跳 60s + 抖动余量 */
-  const p = players.value || {}
-  redOnline.value = !p.red || p.red.clientId === uid || fresh(p.red.clientId)
-  blueOnline.value = !p.blue || p.blue.clientId === uid || fresh(p.blue.clientId)
-  const otherSeat = myTeam.value === 'A' ? 'blue' : myTeam.value === 'B' ? 'red' : null
-  peerKickable.value =
-    !!otherSeat && !!gotRoomSnapshot.value && !!p[otherSeat] && now - lastSeen(p[otherSeat].clientId) > 130000
-  ensureSeat() /* 无席兜底：竞速遗漏的观战态在这里自愈 */
+  peersInfo = next
+  peersSeen = true
+  refreshOnline()
+  ensureSeat() /* 无席兜底：快照到齐即补坐 */
 }
+function onPeerOnline(clientId) {
+  if (!clientId) return
+  peersInfo = { ...peersInfo, [clientId]: { online: true, offlineAt: 0 } }
+  refreshOnline()
+}
+function onPeerOffline(clientId, code) {
+  if (!clientId) return
+  peersInfo = { ...peersInfo, [clientId]: { online: false, offlineAt: Date.now() } }
+  refreshOnline()
+  if (code === 4001) flashTip('对方已被移出房间。', 'warn')
+  else flashTip('对方连接已断开。', 'warn')
+}
+/* 由 peersInfo 推导红青两营在线徽标 + 安排「离线满 1 分钟」的踢出按钮 */
+function refreshOnline() {
+  const now = Date.now()
+  const p = players.value || {}
+  const isOnline = (cid) => !cid || cid === uid || !!(peersInfo[cid] && peersInfo[cid].online)
+  redOnline.value = isOnline(p.red && p.red.clientId)
+  blueOnline.value = isOnline(p.blue && p.blue.clientId)
+  if (kickTimer) {
+    clearTimeout(kickTimer)
+    kickTimer = null
+  }
+  peerKickable.value = false
+  const otherSeat = myTeam.value === 'A' ? 'blue' : myTeam.value === 'B' ? 'red' : null
+  const target = otherSeat && p[otherSeat] && p[otherSeat].clientId
+  const info = target && peersInfo[target]
+  if (!target || !info || info.online) return
+  const wait = 60000 - (now - info.offlineAt) /* 离线满 1 分钟 → 出现踢出按钮 */
+  if (wait <= 0) {
+    peerKickable.value = true
+    return
+  }
+  kickTimer = setTimeout(() => {
+    kickTimer = null
+    peerKickable.value = true
+  }, wait)
+}
+/* 席位人员变化（坐席/换营/踢出/云端同步）→ 重算在线徽标与踢出按钮 */
+watch(() => players.value, refreshOnline)
 
 /* ---- 坐席兜底（替代原 joinPending 单次选席）：房内但无席时随时补坐 ----
-   空席优先（全空进青营）；占席仅当占席者已离线（不在连接池或 lastSeen 过期超 70s），
+   空席优先（全空进青营）；占席仅当占席者已离线（不在线上名单，由 peers 快照/事件给出），
    双席均离线时顶离线更久者；被顶者是房主 → 房主随之转让。
    两席均有人且在线：新加入者退出回大厅；曾占席者等待顶替者的踢出广播。 */
 function ensureSeat() {
   if (!roomCode.value || seatOf(uid)) return
-  if (!whoSeen || !gotRoomSnapshot.value) return
-  const now = Date.now()
+  if (!peersSeen || !gotRoomSnapshot.value) return
   const p = players.value || {}
-  const inPool = (cid) => lastPeers.some((x) => x.clientId === cid) /* 不在连接池 = 对方无任何连接，可顶替 */
-  const lastSeen = (cid) => {
-    const peer = lastPeers.find((x) => x.clientId === cid)
-    return peer ? peer.lastSeen || 0 : 0
-  }
+  const isOnline = (cid) => !!(peersInfo[cid] && peersInfo[cid].online)
+  const offlineAt = (cid) => (peersInfo[cid] && peersInfo[cid].offlineAt) || 0 /* 无记录视为最早已离线 */
   const empty = (s) => !p[s] || !p[s].clientId
-  const away = (s) => !empty(s) && (!inPool(p[s].clientId) || now - lastSeen(p[s].clientId) > 70000)
+  const away = (s) => !empty(s) && !isOnline(p[s].clientId)
   let target = null
   if (empty('blue') && empty('red')) target = 'blue'
   else if (empty('blue')) target = 'blue'
   else if (empty('red')) target = 'red'
-  else if (away('blue') && away('red')) target = lastSeen(p.red.clientId) <= lastSeen(p.blue.clientId) ? 'red' : 'blue'
+  else if (away('blue') && away('red')) target = offlineAt(p.red.clientId) <= offlineAt(p.blue.clientId) ? 'red' : 'blue'
   else if (away('blue')) target = 'blue'
   else if (away('red')) target = 'red'
   if (!target) {
@@ -343,7 +376,7 @@ const canSwitchSide = computed(() => {
 })
 
 let pendingCreate = false /* 建房者标记：WS 连接建立后立即推送初始 state */
-let joinPending = null /* 加入中：{ code, decided }，快照 + __who 到齐后选席 */
+let joinPending = null /* 加入中：{ code, decided }，快照 + peers 到齐后选席 */
 function enterRoom(code, asHost) {
   roomCode.value = code
   sessionStorage.setItem('fh_room', code)
@@ -353,27 +386,21 @@ function enterRoom(code, asHost) {
     clientId: uid,
     onOpen: onWsOpen,
     onMessage: (st) => applyRoomSnapshot(st),
-    onWho: onWho,
-    onPeerClosed: onPeerClosed,
+    onPeers: onPeers,
+    onPeerOnline: onPeerOnline,
+    onPeerOffline: onPeerOffline,
     onRejected: onWsRejected,
   })
 }
-/* 连接建立：DO 会把已保存的 state 回放给新连接（applyRoomSnapshot 处理）；
-   建房者在此立即推送初始 state，让房间在云端有第一份快照 */
+/* 连接建立：DO 会把已保存的 state 回放给新连接（applyRoomSnapshot 处理），
+   并在 __hello 后回发 peers 成员快照（onPeers 处理）；建房者在此立即推送初始 state */
 function onWsOpen() {
   if (pendingCreate) {
     pendingCreate = false
     syncState()
   }
-  sendRaw('__who') /* 立即拉一次在线状态 */
 }
-/* 对端掉线广播（DO webSocketClose 发出）→ 立即提示并刷新在线状态 */
-function onPeerClosed(info) {
-  if (info && info.code === 4001) flashTip('对方已被移出房间。', 'warn')
-  else flashTip('对方连接已断开。', 'warn')
-  sendRaw('__who')
-}
-/* DO 拒绝连接（4001 房间已满 / 被踢出，4000 席位被顶替）→ 回大厅 */
+/* DO 拒绝连接（4001 连接数超限 / 被踢出，4000 席位被顶替）→ 回大厅 */
 function onWsRejected(code, reason) {
   if (/踢出/.test(reason || '')) exitRoom('kicked')
   else if (/顶替/.test(reason || '')) exitRoom('replaced')
@@ -402,8 +429,12 @@ function exitRoom(reason) {
   peerKickable.value = false
   gotRoomSnapshot.value = false
   iHadSeat = false
-  whoSeen = false
-  lastPeers = []
+  peersSeen = false
+  peersInfo = {}
+  if (kickTimer) {
+    clearTimeout(kickTimer)
+    kickTimer = null
+  }
   pendingCreate = false
   joinPending = null
   roomState.value = 'lobby'
@@ -487,7 +518,7 @@ async function joinRoom() {
     lobbyMsg.value = null
     joinPending = { code, decided: false }
     enterRoom(code, false)
-    /* 坐席由 ensureSeat 兜底（快照/__who 到齐即补坐）；3 秒内无快照 → 房间不存在 */
+    /* 坐席由 ensureSeat 兜底（快照/peers 到齐即补坐）；3 秒内无快照 → 房间不存在 */
     setTimeout(() => {
       if (!joinPending) return
       if (!gotRoomSnapshot.value) {
@@ -495,11 +526,11 @@ async function joinRoom() {
         exitRoom()
         lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
         joinPending = null
-      } else if (whoSeen) {
-        ensureSeat() /* 兜底：__who 已到但竞速错过 onWho 的 ensureSeat */
-        joinPending = null /* 快照已到，房间存在性已判定；后续选席由 ensureSeat 常驻兜底 */
+      } else if (peersSeen) {
+        ensureSeat() /* 兜底：peers 快照已到但竞速错过 onPeers 的 ensureSeat */
+        joinPending = null /* 房间存在性已判定；后续选席由 ensureSeat 常驻兜底 */
       }
-      /* 快照已到、__who 未到：保留 joinPending，等 onWho → ensureSeat 完成选席 */
+      /* 快照已到、peers 未到：保留 joinPending，等 onPeers → ensureSeat 完成选席 */
     }, 3000)
   } finally {
     roomBusy.value = false
@@ -1249,14 +1280,14 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                    @click="canSwitchSide && pickTeam('A')">
                 <span class="swatch"></span>{{ teamNames.A }} <span class="num">{{ score.a }}</span>
                 <button v-if="myTeam === 'B' && !redOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'B' && !redOnline" class="offbadge" title="超过 1 分钟没有心跳">离线</span>
+                <span v-else-if="myTeam === 'B' && !redOnline" class="offbadge" title="对方连接已断开">离线</span>
               </div>
               <div class="team tB" :class="{ active: gameState.phase === 'playing' && currentTeam === 'B', mine: myTeam === 'B', selectable: canSwitchSide }"
                    :title="canSwitchSide ? '点击切换到青营席位' : (myTeam === 'B' ? '你所在的阵营' : '')"
                    @click="canSwitchSide && pickTeam('B')">
                 <span class="swatch"></span>{{ teamNames.B }} <span class="num">{{ score.b }}</span>
                 <button v-if="myTeam === 'A' && !blueOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'A' && !blueOnline" class="offbadge" title="超过 1 分钟没有心跳">离线</span>
+                <span v-else-if="myTeam === 'A' && !blueOnline" class="offbadge" title="对方连接已断开">离线</span>
               </div>
             </div>
           </div>
@@ -1314,7 +1345,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                 <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色。</li>
                 <li>合法性：本句命中棋盘的字中，<b>至少要有 1 个格子当前未填色</b>；命中已涂色格可以抢夺。若命中格全都是已有颜色，本句无效。</li>
                 <li>胜负：不限轮数，点「<b>结算</b>」随时结束本局，<b>己方颜色格子多者胜</b>；等同则平局。</li>
-                <li>离线：对方超过 <b>1 分钟</b>无心跳即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；离线再满 1 分钟，队名处出现「<b>踢出</b>」按钮，可手动将其移出房间（不自动踢出）。踢出或被新人<b>顶替</b>后席位空出；若被移出者是房主，房主随之转让。新成员加入时自动顶替离线者（双方离线时优先顶替离线更久者）；赤青两席<b>都有人且在线</b>时不允许第三人加入。双方都不在线满 24 小时的房间会被清理。</li>
+                <li>离线：对方<b>断开连接</b>（关闭页面、断网等）即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；离线满 <b>1 分钟</b>，队名处出现「<b>踢出</b>」按钮，可手动将其移出房间（不自动踢出）。踢出或被新人<b>顶替</b>后席位空出；若被移出者是房主，房主随之转让。新成员加入时自动顶替离线者（双方离线时优先顶替离线更久者）；赤青两席<b>都有人且在线</b>时不允许第三人加入。双方都不在线满 24 小时的房间会被清理。</li>
               </ol>
             </div>
           </details>
