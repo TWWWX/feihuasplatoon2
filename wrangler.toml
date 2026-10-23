@@ -1,15 +1,25 @@
-# Cloudflare Worker：诗句词库校验 API + 房间定时清理 Cron
-# 部署/开发均在项目根目录执行：npx wrangler dev / npx wrangler deploy
-name = "feihua-poetry-api"
+# Cloudflare Worker：GameRoom Durable Object（WebSocket 实时转发）+ D1 持久化
+# 开发：npx wrangler dev    部署：npx wrangler deploy
+name = "feihua-realtime"
 main = "worker/index.js"
 compatibility_date = "2026-09-04"
 
-# 每日 UTC 03:00（北京时间 11:00）清理 createdAt 超 24h 的房间
-[triggers]
-crons = ["0 3 * * *"]
-
+# D1：rooms 表（room_id / state / updated_at）作为持久化备份
 [[d1_databases]]
 binding = "DB"
-database_name = "feihua-poetry"
-# npx wrangler d1 create feihua-poetry 后，把输出中的 database_id 粘贴到这里
-database_id = "a797ccd1-0839-435b-94a0-e364907348ee"
+database_name = "feihua-game-db"
+database_id = "55ea6d6e-7296-4512-bced-f58f89d58714"
+
+# Durable Object：每房间一个实例，按 roomId 路由
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "GameRoom"
+
+# 免费计划必须使用 SQLite 后端的 DO 类
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameRoom"]
+
+# 静态资源：前端 dist 与 /ws 同域（未命中资产的请求 fall through 到 Worker 脚本）
+[assets]
+directory = "./dist"

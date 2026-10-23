@@ -26,9 +26,13 @@ dist-ssr
 # 残留的旧子文件夹（内容已平移到根目录，仅剩无法移动的 .vscode）
 feihua-game/
 
+# 旧项目本地完整副本（含 206MB 词库 SQL，禁止入库）
+feihuasplatoon/
+
 # 诗词词库：数据集与生成物仅本地使用
 chinese-poetry/
 poetry_init.sql
 
 # Wrangler 本地状态
 .wrangler/
+.dev.vars
