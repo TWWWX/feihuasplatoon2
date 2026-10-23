@@ -236,11 +236,13 @@ function applyRoomSnapshot(st) {
    - full_state：全量快照（建房/加入/撤销/重开/重铺/设置变更/席位变更）
    - patch_state：增量（提交/放弃/修正模式），只带 board/回合/分数/新增记录，长局不膨胀 */
 function syncState() {
+  if (isLocalMode.value) return /* 本地主持台：不走网络 */
   if (!roomCode.value) return
   sendRaw(JSON.stringify({ type: 'full_state', state: localToCloudState() }))
 }
 /* 增量同步：newLogs 为本次新产生的 log 项（本地形态），序列化时复用 localToCloudState 的映射口径 */
 function syncPatch(newLogs) {
+  if (isLocalMode.value) return /* 本地主持台：不走网络 */
   if (!roomCode.value) return
   const full = localToCloudState()
   const n = (newLogs || []).length
@@ -285,6 +287,78 @@ function applyPatch(p) {
   for (const e of p.historyAppend || []) {
     gameState.log.push({ ...e, team: e.team === 'red' ? 'A' : e.team === 'blue' ? 'B' : e.team })
   }
+}
+
+/* ---- 本地主持台模式（不联网，同屏双方交替；localStorage 持久化进度） ----
+   - 不 connectWs，syncState/syncPatch 全部旁路；myTeam 恒为 null（不依赖席位身份）
+   - 存档 = { gameState, players }：players 只用 name 字段（teamNames computed 从中派生）
+   - 退出房间保留存档，大厅「继续本地对战」恢复；「放弃本地存档」才删除 */
+const LOCAL_KEY = 'fh_local_game'
+const isLocalMode = ref(false)
+const hasLocalSave = ref(false)
+const localNameA = ref('')
+const localNameB = ref('')
+let localSaveTimer = null
+function persistLocalGame() {
+  if (!isLocalMode.value) return
+  try {
+    localStorage.setItem(LOCAL_KEY, JSON.stringify({ gameState, players: players.value, at: Date.now() }))
+    hasLocalSave.value = true
+  } catch {}
+}
+/* 主持台状态自动保存：落子/撤销/修正/开局结算等一切 gameState 变更（深比较 + 300ms 防抖） */
+watch(
+  gameState,
+  () => {
+    if (!isLocalMode.value) return
+    if (localSaveTimer) clearTimeout(localSaveTimer)
+    localSaveTimer = setTimeout(persistLocalGame, 300)
+  },
+  { deep: true }
+)
+watch(players, persistLocalGame) /* 本地改名即时保存 */
+function startLocalGame() {
+  isLocalMode.value = true
+  let restored = false
+  try {
+    const data = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null')
+    if (data && data.gameState && Array.isArray(data.gameState.board) && data.gameState.board.length) {
+      Object.assign(gameState, data.gameState) /* 含 undoStack，撤销历史一并恢复 */
+      if (data.players && data.players.red) players.value = data.players
+      sizeInput.value = gameState.side /* 设置面板回显恢复的棋盘尺寸 */
+      restored = true
+    }
+  } catch {}
+  if (!restored) initLocalGame()
+  roomState.value = 'playing'
+  flashTip(restored ? '已恢复本地存档，继续主持。' : '本地主持台就绪：开局后双方交替出牌。', 'ok')
+}
+function initLocalGame() {
+  players.value = { red: { name: TEAM_NAME.A }, blue: { name: TEAM_NAME.B } }
+  localNameA.value = ''
+  localNameB.value = ''
+  gameState.turnNo = 1
+  gameState.log = []
+  gameState.undoStack = []
+  gameState.phase = 'ready'
+  redrawBoard()
+}
+function discardLocalSave() {
+  if (!confirm('放弃本地存档？当前进度将无法恢复。')) return
+  localStorage.removeItem(LOCAL_KEY)
+  hasLocalSave.value = false
+  flashTip('本地存档已删除。', 'warn')
+}
+/* 本地改名：无席位身份，直接改 players.name（teamNames 派生 + watch 自动存档） */
+function saveLocalName(seat) {
+  const input = seat === 'red' ? localNameA : localNameB
+  const name = input.value.trim()
+  if (!name) { flashTip('阵营名不能为空。', 'warn'); return }
+  if (name.length > 12) { flashTip('阵营名最多 12 个字。', 'err'); return }
+  const p = players.value || {}
+  players.value = { ...p, [seat]: { ...(p[seat] || {}), name } }
+  input.value = ''
+  flashTip('✓ 阵营名已更新，界面与战报图都会显示新名字。', 'ok')
 }
 
 /* ---- 在线状态（事件驱动：peers 快照 + peer_online/peer_offline 推送） ----
@@ -458,6 +532,12 @@ function onWsRejected(code, reason) {
 /* 退出房间：主动退出时若我是房主且另一席有人 → 先转让房主再断开（房主仅是创建者标记，无权限差异）
    reason: 'kicked' 被移出 | 'replaced' 席位被顶替 | 其余为主动退出 */
 function exitRoom(reason) {
+  /* 本地主持台：不涉及连接与席位，保留存档（大厅可「继续本地对战」），直接回大厅 */
+  if (isLocalMode.value) {
+    isLocalMode.value = false
+    roomState.value = 'lobby'
+    return
+  }
   if (!reason && roomCode.value && myTeam.value) {
     const host = roomMeta.value && roomMeta.value.hostId
     const otherSeat = myTeam.value === 'A' ? 'blue' : 'red'
@@ -813,6 +893,7 @@ const previewSet = ref(new Set())
 const poemLocked = computed(() => gameState.phase !== 'playing')
 const poemPlaceholder = computed(() => {
   if (gameState.phase !== 'playing') return '点击上方「开始对战」后解锁'
+  if (isLocalMode.value) return '可先打草稿，随时提交（主持人模式下双方交替出牌）'
   if (!myTurn.value) return '可先打草稿，轮到你时提交'
   return '在此输入诗句，如：床前明月光，疑是地上霜（回车提交）'
 })
@@ -960,7 +1041,7 @@ let submitting = false /* 防重入：await 换繁转简期间连点/连按回�
 async function submitLine() {
   if (gameState.phase !== 'playing') return
   if (submitting) return
-  if (!myTurn.value) {
+  if (!isLocalMode.value && !myTurn.value) {
     flashTip(myTeam.value === null ? '观战身份不能出牌。' : '还没轮到你出牌，请等待对方。', 'err')
     return
   }
@@ -1051,7 +1132,7 @@ function advance() {
 
 function passTurn() {
   if (gameState.phase !== 'playing') return
-  if (!myTurn.value) {
+  if (!isLocalMode.value && !myTurn.value) {
     flashTip(myTeam.value === null ? '观战身份不能出牌。' : '还没轮到你出牌，请等待对方。', 'err')
     return
   }
@@ -1249,6 +1330,7 @@ function lockHint() {
 /* ================= 启动 ================= */
 onMounted(() => {
   /* 断线重连：sessionStorage 记住了房间码就直接回连（clientId 在席位内则自动恢复原席位） */
+  hasLocalSave.value = !!localStorage.getItem(LOCAL_KEY) /* 本地主持台存档探测（按钮文案切换） */
   const saved = sessionStorage.getItem('fh_room')
   if (saved) {
     joinCode.value = saved
@@ -1269,9 +1351,9 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
     <header class="top">
       <h1>飞花斯普拉遁</h1>
       <div class="head-tools">
-        <span class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
+        <span v-if="!isLocalMode" class="conn" :class="fbStatus" :title="fbError || connText"><i></i>{{ connText }}</span>
         <span style="color:#98a4b3;font-size:12px;margin-left:6px;font-weight:600">v3.1</span>
-        <span v-if="roomState === 'playing'" class="conn room">房间 {{ roomCode }}</span>
+        <span v-if="roomState === 'playing'" class="conn room">{{ isLocalMode ? '本地主持台' : '房间 ' + roomCode }}</span>
         <template v-if="roomState === 'playing'">
           <label class="chk" title="开启后，点击棋盘格子可循环切换：无主 → 赤 → 青 → 无主">
             <input type="checkbox" v-model="fixMode" /> 修正模式
@@ -1308,6 +1390,12 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           <div class="row joinrow">
             <input type="text" v-model="joinCode" placeholder="输入 6 位房间码" maxlength="6" @keyup.enter="joinRoom" />
             <button :disabled="roomBusy || !uid" @click="joinRoom">加入房间</button>
+          </div>
+          <p class="sec-title" style="margin-top:14px">本地主持台</p>
+          <div class="row">
+            <button :title="hasLocalSave ? '恢复上次本机主持的对局（刷新/退出不丢进度）' : '同屏双方交替对战，不联网；主持人操作双方棋盘与回合'"
+                    @click="startLocalGame">{{ hasLocalSave ? '继续本地对战' : '本地对战（主持台）' }}</button>
+            <button v-if="hasLocalSave" title="删除本机存档，下次进入为全新一局" @click="discardLocalSave">放弃本地存档</button>
           </div>
           <div v-if="recentRooms.length" class="recent">
             <p class="recent-title">最近加入的房间</p>
@@ -1429,10 +1517,10 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                       @input="onPoemInput" @mousedown="onPoemMousedown" @keydown="onPoemKeydown"></textarea>
             <div class="row" style="margin-top:12px">
               <button class="primary submit" :class="currentTeam === 'A' ? 'team-a' : 'team-b'"
-                      :disabled="gameState.phase !== 'playing' || !myTurn" @click="submitLine">
-                {{ myTurn ? '提交飞花（回车）' : '等待对方出牌...' }}
+                      :disabled="gameState.phase !== 'playing' || (!isLocalMode && !myTurn)" @click="submitLine">
+                {{ isLocalMode ? '提交飞花（当前回合：' + teamNames[currentTeam] + '，回车）' : (myTurn ? '提交飞花（回车）' : '等待对方出牌...') }}
               </button>
-              <button :disabled="gameState.phase !== 'playing' || !myTurn" @click="passTurn">放弃本回合</button>
+              <button :disabled="gameState.phase !== 'playing' || (!isLocalMode && !myTurn)" @click="passTurn">放弃本回合</button>
             </div>
             <div class="row" style="margin-top:10px">
               <button @click="onExportPng" title="生成当前局面战报图（含棋盘与飞花记录）并下载 PNG 文件，与旧版「导出战报」一致">导出战报</button>
@@ -1443,6 +1531,18 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
                      :placeholder="myTeam ? '当前：' + teamNames[myTeam] : ''" @keyup.enter="saveTeamName" />
               <button @click="saveTeamName" title="自定义本方阵营名（最多 12 字），双方界面与战报图统一显示">改阵营名</button>
             </div>
+            <template v-if="isLocalMode">
+              <div class="row" style="margin-top:10px">
+                <input type="text" v-model="localNameA" maxlength="12" style="flex:1;min-width:0"
+                       :placeholder="'赤营改名（当前：' + teamNames.A + '）'" @keyup.enter="saveLocalName('red')" />
+                <button @click="saveLocalName('red')" title="自定义赤营阵营名（最多 12 字），界面与战报图统一显示">赤营改名</button>
+              </div>
+              <div class="row" style="margin-top:8px">
+                <input type="text" v-model="localNameB" maxlength="12" style="flex:1;min-width:0"
+                       :placeholder="'青营改名（当前：' + teamNames.B + '）'" @keyup.enter="saveLocalName('blue')" />
+                <button @click="saveLocalName('blue')" title="自定义青营阵营名（最多 12 字），界面与战报图统一显示">青营改名</button>
+              </div>
+            </template>
             <label class="chk" style="margin-top:10px;display:flex">
               <input type="checkbox" v-model="allowDup" /> 允许重复句（默认拦截已出现过的句子）
             </label>
