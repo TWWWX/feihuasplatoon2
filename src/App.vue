@@ -562,6 +562,12 @@ function loadRecentRooms() {
     return []
   }
 }
+/* 手动删除一条最近房间记录（只清本地列表，不影响房间/对局本身） */
+function removeRecentRoom(code) {
+  if (!confirm(`从最近房间列表中删除「${code}」？`)) return
+  localStorage.setItem(RECENT_KEY, JSON.stringify(loadRecentRooms().filter((r) => r.code !== code)))
+  recentRooms.value = loadRecentRooms()
+}
 function rememberRoom(code, asHost) {
   /* host 是「我是创建者」的事实标记：刷新/回连（joinRoom 路径）不覆盖已有 host=true */
   const prev = loadRecentRooms().find((r) => r.code === code)
@@ -1392,8 +1398,8 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <input type="text" v-model="joinCode" placeholder="输入 6 位房间码" maxlength="6" @keyup.enter="joinRoom" />
             <button :disabled="roomBusy || !uid" @click="joinRoom">加入房间</button>
           </div>
-          <p class="sec-title" style="margin-top:14px">本地主持台</p>
-          <div class="row">
+          <p class="sec-title" style="margin-top:14px;text-align:center">本地主持台</p>
+          <div class="row center">
             <button :title="hasLocalSave ? '恢复上次本机主持的对局（刷新/退出不丢进度）' : '同屏双方交替对战，不联网；主持人操作双方棋盘与回合'"
                     @click="startLocalGame">{{ hasLocalSave ? '继续本地对战' : '本地对战（主持台）' }}</button>
             <button v-if="hasLocalSave" title="删除本机存档，下次进入为全新一局" @click="discardLocalSave">放弃本地存档</button>
@@ -1404,6 +1410,7 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
               <span class="rcode">{{ r.code }}</span>
               <span class="rmeta">{{ r.host ? '我是房主' : '青营席位' }} · {{ relTime(r.at) }}</span>
               <button :disabled="roomBusy || !uid" title="房主重连或以青营加入；房间已被解散时会有提示" @click="rejoin(r)">进入</button>
+              <button class="ghost-del" title="从最近房间列表中删除该条记录（不影响房间本身）" @click="removeRecentRoom(r.code)">删除</button>
             </div>
           </div>
           <p v-if="uid" class="uidline">设备 ID：{{ uid }}</p>
@@ -1690,6 +1697,9 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 /* ---------- 大厅：最近加入的房间 ---------- */
 .recent{margin-top:16px;border-top:1px dashed var(--line);padding-top:12px;}
 .recent-title{margin:0 0 8px;font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.5px;}
+.row.center{justify-content:center;}
+.ghost-del{border:none;background:none;color:#c25342;font-size:12px;font-weight:700;padding:4px 8px;cursor:pointer;border-radius:8px;}
+.ghost-del:hover{background:#FBEDEA;}
 .recent-row{display:flex;align-items:center;gap:10px;padding:6px 0;}
 .recent-row .rcode{font-family:ui-monospace,Consolas,monospace;font-weight:700;font-size:15px;letter-spacing:2px;}
 .recent-row .rmeta{flex:1;min-width:0;font-size:12px;color:var(--muted);}
