@@ -437,7 +437,6 @@ function ensureSeat() {
     }
     return
   }
-  if (joinPending) joinPending.decided = true
   const replacing = !empty(target)
   const oldCid = replacing ? p[target].clientId : null
   const other = target === 'red' ? 'blue' : 'red'
@@ -484,7 +483,7 @@ const canSwitchSide = computed(() => {
 })
 
 let pendingCreate = false /* 建房者标记：WS 连接建立后立即推送初始 state */
-let joinPending = null /* 加入中：{ code, decided }，快照 + peers 到齐后选席 */
+let joinPending = null /* 加入中：{ code, waits }，供 checkJoin 做存在性判定；选席由 ensureSeat 常驻兜底 */
 function enterRoom(code, asHost) {
   roomCode.value = code
   sessionStorage.setItem('fh_room', code)
@@ -526,12 +525,15 @@ function exitRoom(reason) {
   }
   if (!reason && roomCode.value && myTeam.value) {
     const host = roomMeta.value && roomMeta.value.hostId
+    const mySeat = myTeam.value === 'A' ? 'red' : 'blue'
     const otherSeat = myTeam.value === 'A' ? 'blue' : 'red'
     const other = (players.value || {})[otherSeat]
     if (host === uid && other && other.clientId) {
-      roomMeta.value = { ...roomMeta.value, hostId: other.clientId }
-      syncState() /* 推送转让后再断开，DO 异步持久化不丢 */
+      roomMeta.value = { ...roomMeta.value, hostId: other.clientId } /* 房主转让给另一席 */
     }
+    /* 主动退出清掉自己的席位（state 不留幽灵 clientId），与转让合并为一次 full_state 推送 */
+    players.value = { ...(players.value || {}), [mySeat]: null }
+    syncState() /* 推送后再断开，DO 异步持久化不丢 */
   }
   closeWs()
   sessionStorage.removeItem('fh_room')
@@ -639,7 +641,7 @@ async function joinRoom() {
   roomBusy.value = true
   try {
     lobbyMsg.value = null
-    joinPending = { code, decided: false, waits: 0 }
+    joinPending = { code, waits: 0 }
     enterRoom(code, false)
     /* 坐席由 ensureSeat 兜底（快照/peers 到齐即补坐）；存在性判定见 checkJoin */
     const checkJoin = () => {
