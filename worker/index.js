@@ -86,9 +86,9 @@ export class GameRoom {
   async webSocketMessage(ws, message) {
     if (typeof message !== 'string' || !message) return
 
+    let ctrl = null /* 控制与游戏消息共用：声明必须在块外（此前在 if 块内，游戏消息分支引用即抛 ReferenceError，广播与持久化全失效） */
     /* ---- 控制消息：同步处理，无持久化，不阻塞游戏消息 ---- */
     if (message[0] === '{') {
-      let ctrl = null
       try {
         ctrl = JSON.parse(message)
       } catch {
@@ -100,7 +100,7 @@ export class GameRoom {
         ws.serializeAttachment(meta)
         await this.ensureOfflineLog()
         this.offlineLog.delete(meta.clientId) /* 回归者清掉离线记录 */
-        persistOfflineLog(this)
+        await persistOfflineLog(this)
         /* 同 clientId 顶替：页面刷新/断线重连时旧连接可能仍留在池里（close 处理滞后），
            直接关闭旧连接（不广播离线——人还在线），防止死连接堵住连接数上限 */
         for (const s of this.state.getWebSockets()) {
@@ -150,28 +150,25 @@ export class GameRoom {
       }
     }
 
-    /* ---- 游戏消息：先广播（低延迟），持久化不阻塞下行 ----
+    /* ---- 游戏消息：先广播（低延迟），持久化在处理器内 await 完成后返回 ----
+       注意：DO 事件处理器返回后，未被 await 的异步 IO 会被运行时放弃——
+       此前 persist 走 fire-and-forget，落盘间歇性丢失（重连/加入无 state 可回放，
+       表现为「房间不存在/连接失败」误报）。DurableObjectState 没有 waitUntil，必须显式 await。
        full_state：全量快照（建房/加入/撤销/重开/设置等）→ 原样落盘
        patch_state：增量（提交/放弃/修正）→ 广播给对方 + 合并进最近全量后落盘
        其余 JSON（裸 state，兼容旧消息 / DO 回放形态）：原样广播 + 原样落盘 */
     if (ctrl && ctrl.type === 'full_state') {
       this.broadcast(ws, message)
-      const p = this.persist(JSON.stringify(ctrl.state))
-      if (this.state.waitUntil) this.state.waitUntil(p)
-      else p.catch(() => {})
+      await this.persist(JSON.stringify(ctrl.state))
       return
     }
     if (ctrl && ctrl.type === 'patch_state') {
       this.broadcast(ws, message)
-      const p = this.mergePersist(ctrl.patch)
-      if (this.state.waitUntil) this.state.waitUntil(p)
-      else p.catch(() => {})
+      await this.mergePersist(ctrl.patch)
       return
     }
     this.broadcast(ws, message)
-    const p = this.persist(message)
-    if (this.state.waitUntil) this.state.waitUntil(p)
-    else p.catch(() => {})
+    await this.persist(message)
   }
 
   broadcast(from, message) {
@@ -191,7 +188,7 @@ export class GameRoom {
     const meta = readMeta(ws) || {}
     if (meta.clientId) {
       this.offlineLog.set(meta.clientId, Date.now())
-      persistOfflineLog(this)
+      await persistOfflineLog(this)
     }
     const note = JSON.stringify({ type: 'peer_offline', clientId: meta.clientId || null, code })
     for (const other of this.state.getWebSockets()) {
