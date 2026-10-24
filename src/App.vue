@@ -417,16 +417,21 @@ function ensureSeat() {
   const offlineAt = (cid) => (peersInfo[cid] && peersInfo[cid].offlineAt) || 0 /* 无记录视为最早已离线 */
   const empty = (s) => !p[s] || !p[s].clientId
   const away = (s) => !empty(s) && !isOnline(p[s].clientId)
+  /* 在线人数守卫：快照里在线的其他成员 ≥2 → 房间已满员。此时即使 state 显示有空席，
+     那也是尚未落盘/陈旧的快照——据此抢座会覆盖真实玩家，触发对方 iHadSeat 误杀、连环互踢 */
+  const othersOnline = Object.keys(peersInfo).filter((cid) => peersInfo[cid].online).length
   let target = null
-  if (empty('blue') && empty('red')) target = 'blue'
-  else if (empty('blue')) target = 'blue'
-  else if (empty('red')) target = 'red'
-  else if (away('blue') && away('red')) target = offlineAt(p.red.clientId) <= offlineAt(p.blue.clientId) ? 'red' : 'blue'
-  else if (away('blue')) target = 'blue'
-  else if (away('red')) target = 'red'
+  if (othersOnline < 2) {
+    if (empty('blue') && empty('red')) target = 'blue'
+    else if (empty('blue')) target = 'blue'
+    else if (empty('red')) target = 'red'
+    else if (away('blue') && away('red')) target = offlineAt(p.red.clientId) <= offlineAt(p.blue.clientId) ? 'red' : 'blue'
+    else if (away('blue')) target = 'blue'
+    else if (away('red')) target = 'red'
+  }
   if (!target) {
-    if (joinPending && !joinPending.decided) {
-      joinPending.decided = true
+    /* 满员：从未占过席的加入者退出回大厅；曾占席者（刚被顶替）等待 4001 踢出广播 */
+    if (!iHadSeat) {
       exitRoom()
       lobbyMsg.value = { text: '房间已满（赤青两营均有玩家且都在线）。', kind: 'err' }
     }
@@ -634,22 +639,32 @@ async function joinRoom() {
   roomBusy.value = true
   try {
     lobbyMsg.value = null
-    joinPending = { code, decided: false }
+    joinPending = { code, decided: false, waits: 0 }
     enterRoom(code, false)
-    /* 坐席由 ensureSeat 兜底（快照/peers 到齐即补坐）；3 秒内无快照 → 房间不存在 */
-    setTimeout(() => {
-      if (!joinPending) return
-      if (!gotRoomSnapshot.value) {
-        forgetRoom(code)
-        exitRoom()
-        lobbyMsg.value = { text: '房间不存在（可能已解散）。', kind: 'err' }
+    /* 坐席由 ensureSeat 兜底（快照/peers 到齐即补坐）；存在性判定见 checkJoin */
+    const checkJoin = () => {
+      if (!joinPending || roomCode.value !== code) return /* 已退出/已换房：不再判定 */
+      if (gotRoomSnapshot.value) {
+        /* 快照已到：兜底竞速错过 onPeers 的选席；peers 未到则保留 joinPending 等 onPeers */
+        if (peersSeen) ensureSeat()
         joinPending = null
-      } else if (peersSeen) {
-        ensureSeat() /* 兜底：peers 快照已到但竞速错过 onPeers 的 ensureSeat */
-        joinPending = null /* 房间存在性已判定；后续选席由 ensureSeat 常驻兜底 */
+        return
       }
-      /* 快照已到、peers 未到：保留 joinPending，等 onPeers → ensureSeat 完成选席 */
-    }, 3000)
+      /* 无快照：DO 冷启动/断线重连中（非 ok 态）→ 递延等待，勿轻易判死（此前 3s 一刀切误报「房间不存在」） */
+      if (fbStatus.value !== 'ok' && joinPending.waits < 4) {
+        joinPending.waits++
+        setTimeout(checkJoin, 3000)
+        return
+      }
+      /* 连接已成功（ok）却始终无快照 → DO 无此房存档，确为不存在；始终连不上 → 连接失败 */
+      forgetRoom(code)
+      exitRoom()
+      lobbyMsg.value = {
+        text: fbStatus.value === 'ok' ? '房间不存在（可能已解散）。' : '连接房间失败，请检查网络后重试。',
+        kind: 'err',
+      }
+    }
+    setTimeout(checkJoin, 3000)
   } finally {
     roomBusy.value = false
   }
