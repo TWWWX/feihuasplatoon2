@@ -673,11 +673,21 @@ async function joinRoom() {
 }
 /* ================= 常量 ================= */
 const TEAM_NAME = { A: '赤营', B: '青营' }
-/* 阵营名：默认赤营/青营，双方可各自改名；状态条、提示、记录与导出图统一用它 */
-const teamNames = computed(() => ({
-  A: (players.value.red && players.value.red.name) || TEAM_NAME.A,
-  B: (players.value.blue && players.value.blue.name) || TEAM_NAME.B,
-}))
+/* 阵营名：房间对局中席位有真实占席者（clientId）显示其名，无人（未加入/被踢/退出）显示「无人」；
+   本地主持台无 clientId 概念，维持默认名/自定义名。状态条、提示、记录与导出图统一用它 */
+const teamNames = computed(() => {
+  if (isLocalMode.value) {
+    return {
+      A: (players.value.red && players.value.red.name) || TEAM_NAME.A,
+      B: (players.value.blue && players.value.blue.name) || TEAM_NAME.B,
+    }
+  }
+  const label = (seat, fallback) => {
+    const it = players.value[seat]
+    return it && it.clientId ? it.name || fallback : '无人'
+  }
+  return { A: label('red', TEAM_NAME.A), B: label('blue', TEAM_NAME.B) }
+})
 /* 改阵营名：输入框回显自定义名（默认名留空提示），回车或点按钮提交 */
 const teamNameInput = ref('')
 watch([myTeam, roomState], () => {
