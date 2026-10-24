@@ -688,6 +688,9 @@ const teamNames = computed(() => {
   }
   return { A: label('red', TEAM_NAME.A), B: label('blue', TEAM_NAME.B) }
 })
+/* 席位无人（未加入/被踢/退出）：顶栏该席显示「换位」徽标，点击换到此席 */
+const redEmpty = computed(() => !(players.value.red && players.value.red.clientId))
+const blueEmpty = computed(() => !(players.value.blue && players.value.blue.clientId))
 /* 改阵营名：输入框回显自定义名（默认名留空提示），回车或点按钮提交 */
 const teamNameInput = ref('')
 watch([myTeam, roomState], () => {
@@ -1300,7 +1303,7 @@ function again() {
 function clampSizeInput() {
   let n = parseInt(sizeInput.value, 10)
   if (!isFinite(n)) n = gameState.side
-  n = Math.max(5, Math.min(20, n))
+  n = Math.max(5, Math.min(30, n))
   sizeInput.value = n
   return n
 }
@@ -1448,8 +1451,8 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <input type="checkbox" v-model="fixMode" /> 修正模式
           </label>
           <label class="sizefield" :class="{ off: gameState.phase === 'playing' }"
-                 title="棋盘 N×N（5–20，改完自动重抽棋盘）">
-            <input type="number" v-model.number="sizeInput" min="5" max="20" step="1" inputmode="numeric"
+                 title="棋盘 N×N（5–30，改完自动重抽棋盘）">
+            <input type="number" v-model.number="sizeInput" min="5" max="30" step="1" inputmode="numeric"
                    :disabled="gameState.phase === 'playing'" @change="onSizeChange" />
             <span>× <b>{{ gameState.side }}</b> 格</span>
           </label>
@@ -1513,16 +1516,20 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
               <div class="team tA" :class="{ active: gameState.phase === 'playing' && currentTeam === 'A', mine: myTeam === 'A', selectable: canSwitchSide }"
                    :title="canSwitchSide ? '点击切换到赤营席位' : (myTeam === 'A' ? '你所在的阵营' : '')"
                    @click="canSwitchSide && pickTeam('A')">
-                <span class="swatch"></span>{{ teamNames.A }} <span class="num">{{ score.a }}</span>
-                <button v-if="myTeam === 'B' && !redOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'B' && !redOnline" class="offbadge" title="对方连接已断开">离线</span>
+                <span class="swatch"></span><template v-if="!redEmpty">{{ teamNames.A }}</template>
+                <button v-else class="offbadge swapbadge" title="该席位无人，点击换到赤营席位" @click.stop="pickTeam('A')">换位</button>
+                <span class="num">{{ score.a }}</span>
+                <button v-if="!redEmpty && myTeam === 'B' && !redOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
+                <span v-else-if="!redEmpty && myTeam === 'B' && !redOnline" class="offbadge" title="对方连接已断开">离线</span>
               </div>
               <div class="team tB" :class="{ active: gameState.phase === 'playing' && currentTeam === 'B', mine: myTeam === 'B', selectable: canSwitchSide }"
                    :title="canSwitchSide ? '点击切换到青营席位' : (myTeam === 'B' ? '你所在的阵营' : '')"
                    @click="canSwitchSide && pickTeam('B')">
-                <span class="swatch"></span>{{ teamNames.B }} <span class="num">{{ score.b }}</span>
-                <button v-if="myTeam === 'A' && !blueOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
-                <span v-else-if="myTeam === 'A' && !blueOnline" class="offbadge" title="对方连接已断开">离线</span>
+                <span class="swatch"></span><template v-if="!blueEmpty">{{ teamNames.B }}</template>
+                <button v-else class="offbadge swapbadge" title="该席位无人，点击换到青营席位" @click.stop="pickTeam('B')">换位</button>
+                <span class="num">{{ score.b }}</span>
+                <button v-if="!blueEmpty && myTeam === 'A' && !blueOnline && peerKickable" class="offbadge kickbadge" title="对方离线满 1 分钟，点击移出；对方会被带回大厅" @click.stop="kickPeer">踢出</button>
+                <span v-else-if="!blueEmpty && myTeam === 'A' && !blueOnline" class="offbadge" title="对方连接已断开">离线</span>
               </div>
             </div>
           </div>
@@ -1798,6 +1805,9 @@ input[type=number]:disabled,select:disabled{background:#F2F5FA;border-color:#E1E
 .offbadge{display:inline-block;margin-left:6px;font-size:11px;font-weight:600;color:#B4433A;background:#FBEDEC;border:1px solid #F0C7C4;border-radius:999px;padding:1px 8px;vertical-align:1px;}
 button.offbadge{cursor:pointer;font-family:inherit;line-height:1.5;}
 button.offbadge:hover{background:#F6D9D6;}
+/* 换位徽标：席位无人时显示，蓝系（与离线红系区分） */
+.swapbadge{color:#1E6FB8;background:#EDF4FB;border-color:#C7DCEF;}
+button.swapbadge:hover{background:#DCEAF7;}
 
 /* ---------- layout ---------- */
 .layout{display:grid;grid-template-columns:minmax(0,1fr) 396px;gap:18px;align-items:start;}
