@@ -459,7 +459,7 @@ function ensureSeat() {
 
 /* ---- 切换阵营（点击棋盘上方的阵营标签触发）：目标席为空时，先占目标席再释放原席 ----
    名字跟随：改过自定义名的带到新席位（不回归默认青赤营）；仍是默认名的落到目标席默认名。
-   原席留默认阵营名占位（无 clientId，不占座、新人可入座），记分图例等处显示该营名而非「无人」 */
+   原席置空，营名显示由 teamNames 兜底为该席默认营名（顶栏仍显示「换位」徽标，新人可入座） */
 function pickTeam(t) {
   if (!roomCode.value) return
   if (!myTeam.value || myTeam.value === t) return
@@ -475,7 +475,7 @@ function pickTeam(t) {
   players.value = {
     ...players.value,
     [toSeat]: { clientId: uid, name: custom || TEAM_NAME[t] },
-    [fromSeat]: { name: TEAM_NAME[fromTeam] },
+    [fromSeat]: null,
   }
   syncState()
   flashTip(`已切换到${t === 'A' ? '赤营' : '青营'}席位。`, 'ok')
@@ -678,23 +678,13 @@ async function joinRoom() {
 }
 /* ================= 常量 ================= */
 const TEAM_NAME = { A: '赤营', B: '青营' }
-/* 阵营名：房间对局中席位有真实占席者（clientId）显示其名；换位腾出的占位席（无 clientId、
-   留有默认营名）显示该营名；其余无人席（未加入/被踢/退出）显示「无人」；
-   本地主持台无 clientId 概念，维持默认名/自定义名。状态条、提示、记录与导出图统一用它 */
-const teamNames = computed(() => {
-  if (isLocalMode.value) {
-    return {
-      A: (players.value.red && players.value.red.name) || TEAM_NAME.A,
-      B: (players.value.blue && players.value.blue.name) || TEAM_NAME.B,
-    }
-  }
-  const label = (seat, fallback) => {
-    const it = players.value[seat]
-    if (!it) return '无人'
-    return it.name || fallback
-  }
-  return { A: label('red', TEAM_NAME.A), B: label('blue', TEAM_NAME.B) }
-})
+/* 阵营名：有占席者显示其名（自定义名优先），空席（未加入/被踢/退出/换位腾出）一律显示
+   该席默认营名「赤营/青营」。状态条、提示、记录与导出图统一用它。
+   顶栏空席仍显示「换位」徽标（redEmpty/blueEmpty 按 clientId 判定，与此独立） */
+const teamNames = computed(() => ({
+  A: (players.value.red && players.value.red.name) || TEAM_NAME.A,
+  B: (players.value.blue && players.value.blue.name) || TEAM_NAME.B,
+}))
 /* 席位无人（未加入/被踢/退出）：顶栏该席显示「换位」徽标，点击换到此席 */
 const redEmpty = computed(() => !(players.value.red && players.value.red.clientId))
 const blueEmpty = computed(() => !(players.value.blue && players.value.blue.clientId))
