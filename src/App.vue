@@ -1081,18 +1081,27 @@ function cellsOf(e) {
   })
   return out
 }
-/* 返回 {字: "new"|"cap"|"hold"}：从历史记录重放得到"这一手落子前"每格归谁 */
+/* 返回 {字: "new"|"cap"|"hold"}：仅导出功能（战报 PNG/GIF）逐条调用。
+   优先读提交时注记（e.kinds，零成本）；无注记的老记录才重放历史推演（含格子归属更新）。 */
 function hitKinds(e) {
   const owners = gameState.board.map(() => null)
   let out = null
   for (const x of gameState.log) {
     if (x.type !== 'fly' && x.type !== 'pass') continue
-    const map = {}
+    let map = null
     if (x.type === 'fly') {
-      for (const idx of cellsOf(x)) {
+      if (x.kinds) {
+        map = x.kinds
+      } else {
+        map = {}
+        for (const idx of cellsOf(x)) {
+          if (idx == null || idx < 0 || idx >= owners.length) continue
+          const before = owners[idx]
+          map[gameState.board[idx].ch] = before == null ? 'new' : before === x.team ? 'hold' : 'cap'
+        }
+      }
+      for (const idx of x.cells || cellsOf(x)) {
         if (idx == null || idx < 0 || idx >= owners.length) continue
-        const before = owners[idx]
-        map[gameState.board[idx].ch] = before == null ? 'new' : before === x.team ? 'hold' : 'cap'
         owners[idx] = x.team
       }
     }
@@ -1101,9 +1110,8 @@ function hitKinds(e) {
   return out || {}
 }
 /* 诗句 → 分段数组（命中的字带 new/cap/hold 标记），模板里用 v-for 渲染 */
-function poemSegs(e) {
+function buildSegs(e, map) {
   const s = fmtPoem(e.raw, e.line)
-  const map = hitKinds(e)
   const segs = []
   let run = ''
   const seen = {}
@@ -1122,6 +1130,40 @@ function poemSegs(e) {
   }
   if (run) segs.push({ text: run })
   return segs
+}
+/* 记录渲染缓存：log 变化时一次遍历算出每条记录的命中字义与分段，模板/结算按 entry 查表（O(1)）。
+   旧实现是模板里每条记录各调一次 hitKinds（重放全 log × 扫全盘）：25×25、90 轮时单次
+   渲染约 70-200ms，而输入框每敲一键都会整块重渲染 → 打字/删除明显卡顿。
+   注记优先：带 e.kinds 的记录直接查表（连格子归属都不必推演，也不再依赖 board）；
+   重放仅用于无注记的老记录兜底。 */
+const segCache = computed(() => {
+  const owners = new Array(gameState.board.length).fill(null)
+  const m = new Map()
+  for (const x of gameState.log) {
+    if (x.type !== 'fly' && x.type !== 'pass') continue
+    let kinds = null
+    if (x.type === 'fly') {
+      if (x.kinds) {
+        kinds = x.kinds
+      } else {
+        kinds = {}
+        for (const idx of cellsOf(x)) {
+          if (idx == null || idx < 0 || idx >= owners.length) continue
+          const before = owners[idx]
+          kinds[gameState.board[idx].ch] = before == null ? 'new' : before === x.team ? 'hold' : 'cap'
+        }
+      }
+      for (const idx of x.cells || cellsOf(x)) {
+        if (idx == null || idx < 0 || idx >= owners.length) continue
+        owners[idx] = x.team
+      }
+    }
+    m.set(x, buildSegs(x, kinds || {}))
+  }
+  return m
+})
+function poemSegs(e) {
+  return segCache.value.get(e) || buildSegs(e, {})
 }
 
 /* ================= 核心判定：飞花 ================= */
@@ -1182,6 +1224,14 @@ async function submitLine() {
       turnNo: gameState.turnNo,
     })
 
+    /* 提交时注记：此刻盘面即"落子前"状态，逐格归类 new/cap/hold 存进记录。
+       渲染/导出从此直接查表，不再重放历史；与 hitKinds 重放口径一致（同字多格后者覆盖） */
+    const kinds = {}
+    hits.forEach((idx) => {
+      const before = gameState.board[idx].owner
+      kinds[gameState.board[idx].ch] = before == null ? 'new' : before === me ? 'hold' : 'cap'
+    })
+
     /* 涂色：只改响应式数据，视图自动更新；同时记下本手变化的格子供白描边 */
     const changed = {}
     hits.forEach((idx) => {
@@ -1194,7 +1244,7 @@ async function submitLine() {
     gameState.log.push({
       type: 'fly', team: me, round: currentRound.value, line: norm, norm,
       hits: hits.length, blank: blanks.length, capture: captures.length, hold: holds.length,
-      raw: (raw || '').trim(), cells: hits.slice(),
+      raw: (raw || '').trim(), cells: hits.slice(), kinds,
     })
 
     previewSet.value = new Set()
@@ -1661,7 +1711,8 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           </div>
           <div class="pad" style="padding-top:6px">
             <ul class="loglist">
-              <li v-for="e in flyLogs" :key="e.round + '-' + e.team" :class="e.team === 'A' ? 'tA' : 'tB'">
+              <!-- v-memo：打字/预览只改输入框与棋盘高亮，未变记录整块跳过 VNode 创建与 diff -->
+              <li v-for="e in flyLogs" :key="e.round + '-' + e.team" v-memo="[e, teamNames[e.team]]" :class="e.team === 'A' ? 'tA' : 'tB'">
                 <span class="badge" :class="e.team === 'A' ? 'bA' : 'bB'" :title="teamNames[e.team]">{{ TEAM_MARK[e.team] }}</span>
                 <div class="body">
                   <template v-if="e.type === 'pass'">
