@@ -1,7 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { connectWs, closeWs, sendRaw, sendKick, wsStatus, wsError } from './useWebSocket'
-import { POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS } from './game/pools'
+import { POOL_SET, EXTRA, EXTRA_WT, EXTRA_FREQ, POOL_GROUPS, XUANJI_STR } from './game/pools'
 import { exportShotPng, exportShotGif } from './game/exporter'
 
 /* ================= 连接状态（WebSocket → GameRoom；变量名沿用旧模板绑定） =================
@@ -145,7 +145,9 @@ function seededPickExtras(k, rng, excludeSet) {
   }
   return out
 }
-function buildBoard(seed, side, extraN, poolChars) {
+function buildBoard(seed, side, extraN, poolChars, fixedOrder) {
+  /* 璇玑图固定盘：原文按给定顺序原样铺盘（不洗牌、不掺额外字，多于 side² 截断） */
+  if (fixedOrder) return poolChars.slice(0, side * side).map((ch) => ({ ch, owner: null }))
   const rng = mulberry32(seed)
   const total = side * side
   const poolSet = new Set(poolChars)
@@ -163,7 +165,7 @@ function localToCloudState() {
     side: gameState.side,
     totalRounds: 0,
     endless: true,
-    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0),
+    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0) | (poolSel.value.xuanji ? 512 : 0),
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -759,12 +761,16 @@ const POOL_OPTIONS = [
   { key: 'xin', label: '辛弃疾词 1–200' },
   { key: 'xin2', label: '辛弃疾词 201–400' },
   { key: 'xin3', label: '辛弃疾词 401–600' },
+  { key: 'xuanji', label: '璇玑图（固定盘）' },
 ]
-const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true }) // 默认全选
+const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji: false }) // 默认九库全选
 const activePool = computed(() => {
+  /* 璇玑图固定盘：原文原样（保留重复字与顺序），不走并集去重 */
+  if (poolSel.value.xuanji) return Array.from(XUANJI_STR)
   const out = []
   const seen = new Set()
   for (const opt of POOL_OPTIONS) {
+    if (opt.key === 'xuanji') continue
     if (!poolSel.value[opt.key]) continue
     for (const ch of POOL_GROUPS[opt.key]) {
       if (!seen.has(ch)) {
@@ -777,24 +783,42 @@ const activePool = computed(() => {
 })
 const activePoolSet = computed(() => new Set(activePool.value))
 const extraAvail = computed(() => EXTRA.reduce((n, ch) => (activePoolSet.value.has(ch) ? n : n + 1), 0))
+/* 字库面板展示列表：璇玑图原文含重复字，面板按去重后的字展示（棋盘仍用原始序列） */
+const poolPanelList = computed(() => (poolSel.value.xuanji ? Array.from(new Set(activePool.value)) : activePool.value))
 function togglePool(key) {
   if (gameState.phase !== 'ready') return
   const remaining = POOL_OPTIONS.filter((o) => o.key !== key && poolSel.value[o.key]).length
   if (poolSel.value[key] && remaining === 0) return // 至少保留一个字库
-  poolSel.value[key] = !poolSel.value[key]
+  if (key === 'xuanji') {
+    /* 璇玑图只能单独选择：勾选时自动清空九库并锁定 29×29 */
+    poolSel.value.xuanji = !poolSel.value.xuanji
+    if (poolSel.value.xuanji) {
+      for (const o of POOL_OPTIONS) if (o.key !== 'xuanji') poolSel.value[o.key] = false
+      sizeInput.value = 29
+      applySize()
+      redrawBoard()
+      syncState()
+      flashTip('已切换到璇玑图固定盘：29×29 原文 841 字，顺序固定、不随机、不掺额外字。', 'ok')
+      return
+    }
+  } else {
+    /* 勾任何其他库时自动取消璇玑图（互斥单选） */
+    if (!poolSel.value[key] && poolSel.value.xuanji) poolSel.value.xuanji = false
+    poolSel.value[key] = !poolSel.value[key]
+  }
   redrawBoard()
   syncState()
 }
 function selectAllPools() {
   if (gameState.phase !== 'ready') return
-  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true }
+  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji: false }
   redrawBoard()
   syncState()
 }
 function applyPoolMask(mask) {
-  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256；
-     旧对局(0-127)无 su3/xin3 位，解析为未勾，可手动补选 */
-  const m = typeof mask === 'number' && mask >= 0 && mask <= 511 ? mask : 511
+  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256 xuanji=512；
+     旧对局(0-511)无 xuanji 位，解析为未勾；xuanji 对局 side 恒为 29 */
+  const m = typeof mask === 'number' && mask >= 0 && mask <= 1023 ? mask : 511
   poolSel.value = {
     tang: !!(m & 1),
     song: !!(m & 2),
@@ -805,6 +829,7 @@ function applyPoolMask(mask) {
     xin2: !!(m & 64),
     su3: !!(m & 128),
     xin3: !!(m & 256),
+    xuanji: !!(m & 512),
   }
 }
 
@@ -893,11 +918,21 @@ async function toSimplified(s) {
 /* ================= 棋盘 ================= */
 /* 由 seed 确定性生成：host 重抽时产生新 seed 并随 state 同步，双方棋盘一致 */
 function redrawBoard(seed = Math.floor(Math.random() * 2 ** 31)) {
-  const cap = Math.min(cellTotal.value, EXTRA.length)
-  const extraN = Math.max(0, Math.min(cap, parseInt(extraInput.value, 10) || 0))
-  extraInput.value = extraN
-  gameState.seed = seed
-  gameState.board = buildBoard(seed, gameState.side, extraN, activePool.value)
+  if (poolSel.value.xuanji) {
+    /* 璇玑图固定盘：29×29 原文 841 字，重抽结果不变（待开局时重抽按钮禁用） */
+    if (gameState.side !== 29) {
+      gameState.side = 29
+      sizeInput.value = 29
+    }
+    gameState.seed = seed
+    gameState.board = buildBoard(seed, 29, 0, activePool.value, true)
+  } else {
+    const cap = Math.min(cellTotal.value, EXTRA.length)
+    const extraN = Math.max(0, Math.min(cap, parseInt(extraInput.value, 10) || 0))
+    extraInput.value = extraN
+    gameState.seed = seed
+    gameState.board = buildBoard(seed, gameState.side, extraN, activePool.value)
+  }
   previewSet.value = new Set()
   changedNow.value = {}
   removedCells.value = new Set() /* 重抽即重开选字 */
@@ -944,6 +979,7 @@ function toggleRemovedCell(idx) {
 }
 function onPoolSwapPick(ch) {
   if (gameState.phase !== 'ready') return
+  if (poolSel.value.xuanji) return /* 璇玑图固定盘：不支持换字 */
   /* 字库点字与棋盘点字等价：棋盘上的字 → 取消/恢复（被取消的字仍占格，poolOn 仍为真，toggle 即恢复）；棋盘外的字 → 补位 */
   if (poolOn.value[ch]) {
     const idx = gameState.board.findIndex((c) => c.ch === ch)
@@ -997,11 +1033,41 @@ function markChanged(map) {
 }
 
 /* 每格当前的"视觉颜色令牌"：相邻格令牌相同且非空白 → 格线隐藏，墨块连成整片 */
+/* 璇玑图预览：草稿句每字只涂一个格（与提交判定同一优先级：空白 → 对方 → 己方，盘面顺序取最前），
+   返回目标格下标集合；普通模式按字预览（同字全涂） */
+const xuanjiTargets = computed(() => {
+  const s = new Set()
+  if (!poolSel.value.xuanji || gameState.phase !== 'playing' || !previewSet.value.size) return s
+  const me = myTeam.value
+  const other = me === 'A' ? 'B' : 'A'
+  const board = gameState.board
+  for (const ch of previewSet.value) {
+    let blank = -1, cap = -1, own = -1
+    for (let i = 0; i < board.length; i++) {
+      if (board[i].ch !== ch) continue
+      const o = board[i].owner
+      if (!o) {
+        blank = i
+        break
+      }
+      if (o === other) {
+        if (cap < 0) cap = i
+      } else if (own < 0) own = i
+    }
+    const t = blank >= 0 ? blank : cap >= 0 ? cap : own
+    if (t >= 0) s.add(t)
+  }
+  return s
+})
+function inPreview(i, ch) {
+  if (gameState.phase !== 'playing') return false
+  return poolSel.value.xuanji ? xuanjiTargets.value.has(i) : previewSet.value.has(ch)
+}
 function colorToken(i) {
   const cell = gameState.board[i]
   if (!cell) return 'blank'
   const o = cell.owner
-  if (gameState.phase === 'playing' && previewSet.value.has(cell.ch)) {
+  if (inPreview(i, cell.ch)) {
     const t = myTeam.value
     if (o === t) return 'own' + t
     return 'pv' + t + (o || 'N')
@@ -1018,7 +1084,7 @@ function cellClass(i) {
   const token = colorToken(i)
   const cls = ['cell']
   if (cell.owner) cls.push('own-' + cell.owner)
-  if (gameState.phase === 'playing' && previewSet.value.has(cell.ch)) {
+  if (inPreview(i, cell.ch)) {
     cls.push('pv-' + myTeam.value)
     if (!cell.owner) cls.push('pv-new')
     else if (cell.owner !== myTeam.value) cls.push('pv-cap')
@@ -1036,9 +1102,9 @@ function cellClass(i) {
 
 /* 修正模式：点击格子循环切换 无主 → 赤 → 青 → 无主 */
 function onCellClick(idx) {
-  /* 选字环节：点棋盘字 = 取消/恢复（换字模式），与修正模式互斥 */
+  /* 选字环节：点棋盘字 = 取消/恢复（换字模式），与修正模式互斥；璇玑图固定盘不支持换字 */
   if (gameState.phase === 'ready') {
-    if (!fixMode.value) toggleRemovedCell(idx)
+    if (!fixMode.value && !poolSel.value.xuanji) toggleRemovedCell(idx)
     return
   }
   if (!fixMode.value) return
@@ -1189,14 +1255,38 @@ async function submitLine() {
     const hits = [], blanks = [], captures = [], holds = []
     const me = currentTeam.value
     const other = me === 'A' ? 'B' : 'A'
-    gameState.board.forEach((cell, idx) => {
-      if (set[cell.ch]) {
-        hits.push(idx)
-        if (!cell.owner) blanks.push(idx)
-        else if (cell.owner === other) captures.push(idx)
-        else holds.push(idx)
+    if (poolSel.value.xuanji) {
+      /* 璇玑图：每字只涂一个格 —— 优先占该字最靠前的空白格（从左到右、从上到下），
+         无空白则抢最靠前的对方格，该字全归己方则记己方格 */
+      for (const ch of Object.keys(set)) {
+        let blank = -1, cap = -1, own = -1
+        gameState.board.forEach((cell, idx) => {
+          if (cell.ch !== ch) return
+          if (!cell.owner) {
+            if (blank < 0) blank = idx
+          } else if (cell.owner === other) {
+            if (cap < 0) cap = idx
+          } else if (own < 0) own = idx
+        })
+        const t = blank >= 0 ? blank : cap >= 0 ? cap : own
+        if (t >= 0) {
+          hits.push(t)
+          const o = gameState.board[t].owner
+          if (!o) blanks.push(t)
+          else if (o === other) captures.push(t)
+          else holds.push(t)
+        }
       }
-    })
+    } else {
+      gameState.board.forEach((cell, idx) => {
+        if (set[cell.ch]) {
+          hits.push(idx)
+          if (!cell.owner) blanks.push(idx)
+          else if (cell.owner === other) captures.push(idx)
+          else holds.push(idx)
+        }
+      })
+    }
 
     if (!hits.length) {
       flashTip('✕ 无命中：这句里没有出现棋盘上的任何字，本句无效，请换一句。', 'err')
@@ -1497,19 +1587,21 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           <label class="chk" title="开启后，点击棋盘格子可循环切换：无主 → 赤 → 青 → 无主">
             <input type="checkbox" v-model="fixMode" /> 修正模式
           </label>
-          <label class="sizefield" :class="{ off: gameState.phase === 'playing' }"
-                 title="棋盘 N×N（5–30，改完自动重抽棋盘）">
+          <label class="sizefield" :class="{ off: gameState.phase === 'playing' || poolSel.xuanji }"
+                 title="棋盘 N×N（5–30，改完自动重抽棋盘）；璇玑图模式下固定 29×29">
             <input type="number" v-model.number="sizeInput" min="5" max="30" step="1" inputmode="numeric"
-                   :disabled="gameState.phase === 'playing'" @change="onSizeChange" />
+                   :disabled="gameState.phase === 'playing' || poolSel.xuanji" @change="onSizeChange" />
             <span>× <b>{{ gameState.side }}</b> 格</span>
           </label>
-          <label class="sizefield" :class="{ off: gameState.phase === 'playing' }"
-                 title="额外字：从额外字池（自动避开已选基础字库）按唐诗+宋词合计频次加权抽取 K 个放进棋盘（0 = 只用基础字库）">
+          <label class="sizefield" :class="{ off: gameState.phase === 'playing' || poolSel.xuanji }"
+                 title="额外字：从额外字池（自动避开已选基础字库）按唐诗+宋词合计频次加权抽取 K 个放进棋盘（0 = 只用基础字库）；璇玑图模式下不启用">
             <input type="number" v-model.number="extraInput" min="0" step="1" inputmode="numeric"
-                   :disabled="gameState.phase === 'playing'" @change="onExtraChange" />
+                   :disabled="gameState.phase === 'playing' || poolSel.xuanji" @change="onExtraChange" />
             <span>个额外字</span>
           </label>
-          <button v-if="gameState.phase !== 'playing'" @click="redrawOrAgain">{{ redrawLabel }}</button>
+          <button v-if="gameState.phase !== 'playing'" :disabled="gameState.phase === 'ready' && poolSel.xuanji"
+                  :title="gameState.phase === 'ready' && poolSel.xuanji ? '璇玑图为固定盘，内容与顺序不变' : ''"
+                  @click="redrawOrAgain">{{ redrawLabel }}</button>
           <button v-if="gameState.phase === 'ready'" class="primary" @click="startGame">开始对战</button>
           <button v-if="gameState.phase === 'playing'" :disabled="!gameState.undoStack.length" @click="undo">撤销一步</button>
           <button v-if="gameState.phase === 'playing'" @click="onFinish">结算</button>
@@ -1601,19 +1693,20 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           </div>
 
           <details>
-            <summary>基础字库（{{ activePool.length }} 字）</summary>
+            <summary>基础字库（{{ poolPanelList.length }} 字）</summary>
             <div class="detbody">
-              <div class="poolpick" :title="gameState.phase === 'ready' ? '勾选参与抽样的字库集合（并集去重）；随房间同步双方' : '仅待开局时可调整'">
+              <div class="poolpick" :title="gameState.phase === 'ready' ? '勾选参与抽样的字库集合（并集去重）；璇玑图只能单独选择；随房间同步双方' : '仅待开局时可调整'">
                 <button v-for="opt in POOL_OPTIONS" :key="opt.key" :class="{ on: poolSel[opt.key] }"
                         :disabled="gameState.phase !== 'ready'" @click="togglePool(opt.key)">{{ opt.label }}</button>
                 <button class="primary" :disabled="gameState.phase !== 'ready'"
-                        @click="selectAllPools" title="七个字库全部参与（默认）">全选</button>
+                        @click="selectAllPools" title="九库全部参与（默认，不含璇玑图）">全选</button>
               </div>
               <div class="poolgrid swap">
-                <span v-for="ch in activePool" :key="ch" :class="{ on: poolOn[ch] && !removedChars.has(ch) }"
-                      :title="poolOn[ch] ? (removedChars.has(ch) ? '已取消，点击恢复' : '点击取消棋盘上的该字') : '点击用该字补位被取消的棋盘字'"
+                <span v-for="ch in poolPanelList" :key="ch" :class="{ on: poolOn[ch] && !removedChars.has(ch) }"
+                      :title="poolSel.xuanji ? '璇玑图固定盘，不支持换字' : (poolOn[ch] ? (removedChars.has(ch) ? '已取消，点击恢复' : '点击取消棋盘上的该字') : '点击用该字补位被取消的棋盘字')"
                       @click="onPoolSwapPick(ch)">{{ ch }}</span>
               </div>
+              <p v-if="poolSel.xuanji" class="poolnote">璇玑图模式：棋盘固定为 29×29 的《璇玑图》原文 841 字（按行原文、顺序固定、不随机、不掺额外字、不支持换字，尺寸与额外字输入已锁定）。命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格。</p>
               <p class="poolnote">勾选的字库集合取并集去重后构成基础字库。开局前可换字：点棋盘上（或下方字库里）不要的字取消选中，再点别的字补位；取消与补位数量相等（棋盘无空缺）才能开局。换字只影响本盘，重抽/再来一局会重铺。</p>
             </div>
           </details>
@@ -1635,8 +1728,9 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <div class="detbody">
               <ol class="rules">
                 <li>棋盘：从<b>基础字库</b>（默认为「全唐诗 300 + 全宋词 300 + 宋词 300·不含唐诗字 + 苏轼词 1–200 / 201–400 / 401–600 + 辛弃疾词 1–200 / 201–400 / 401–600」九库并集去重，可在「基础字库」面板勾选参与集合）中<b>随机抽 N×N 个不重复的字</b>铺成方阵（N 可在顶栏设 5–20）。顶栏「<b>额外字</b>」可指定其中 K 格改从<b>额外字池</b>（自动避开已选基础字库）里抽 —— 抽取<b>按唐诗与宋词合计频次加权</b>，越常见的字越容易被抽中。</li>
-                <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色。</li>
+                <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色（璇玑图模式除外，见下）。</li>
                 <li>合法性：本句命中棋盘的字中，<b>至少要有 1 个格子当前未填色</b>；命中已涂色格可以抢夺。若命中格全都是已有颜色，本句无效。</li>
+                <li>璇玑图模式：勾选「<b>璇玑图（固定盘）</b>」时只能单选此库，棋盘固定为 <b>29×29 的《璇玑图》原文 841 字</b>——按行原文、顺序固定不随机、不掺额外字、不支持换字、尺寸锁定 29。此模式下命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格；其余规则不变。</li>
                 <li>胜负：不限轮数，点「<b>结算</b>」随时结束本局，<b>己方颜色格子多者胜</b>；等同则平局。</li>
                 <li>离线：对方<b>断开连接</b>（关闭页面、断网等）即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；离线满 <b>1 分钟</b>，队名处出现「<b>踢出</b>」按钮，可手动将其移出房间（不自动踢出）。踢出或被新人<b>顶替</b>后席位空出；若被移出者是房主，房主随之转让。新成员加入时自动顶替离线者（双方离线时优先顶替离线更久者）；赤青两席<b>都有人且在线</b>时不允许第三人加入。双方都不在线满 24 小时的房间会被清理。</li>
               </ol>
