@@ -687,9 +687,10 @@ const teamNames = computed(() => ({
   A: (players.value.red && players.value.red.name) || TEAM_NAME.A,
   B: (players.value.blue && players.value.blue.name) || TEAM_NAME.B,
 }))
-/* 席位无人（未加入/被踢/退出）：顶栏该席显示「换位」徽标，点击换到此席 */
-const redEmpty = computed(() => !(players.value.red && players.value.red.clientId))
-const blueEmpty = computed(() => !(players.value.blue && players.value.blue.clientId))
+/* 席位无人（未加入/被踢/退出）：顶栏该席显示「换位」徽标，点击换到此席；
+   本地主持台无双席联机概念，恒按有名处理，直接显示默认营名（不显示换位） */
+const redEmpty = computed(() => !isLocalMode.value && !(players.value.red && players.value.red.clientId))
+const blueEmpty = computed(() => !isLocalMode.value && !(players.value.blue && players.value.blue.clientId))
 /* 改阵营名：输入框回显自定义名（默认名留空提示），回车或点按钮提交 */
 const teamNameInput = ref('')
 watch([myTeam, roomState], () => {
