@@ -8,7 +8,7 @@
      TANG = 唐诗 top300；SONG = 宋词 top300；SONGX = 宋词 top300 中非 TANG 字；
      SU/XIN 各三档 = 作者词频 1-200 / 201-400 / 401-600；
      补充库 SU4/XIN4 = 作者词频 601-700（补位缓冲，不参与抽字、不在界面显示）；
-     EXTRA = 全库 top2000 − 九库并集（+ 强制追加的排除字），频次降序，同频按码点。
+     EXTRA = 全库 top2000 全量（+ 强制追加的排除字），频次降序，同频按码点；运行时按勾选的基础库集合剔除。
    用法：node scripts/rebuild-pools.js [--write]   （默认 dry-run：只打印 diff，不写文件） */
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -90,11 +90,8 @@ const XIN = tier(xinFreq)
 const SU4 = SU.slice(600, 700)
 const XIN4 = XIN.slice(600, 700)
 
-/* 九库并集不含补充库（SU4/XIN4 只是补位缓冲） */
-const unionSet = new Set([...TANG, ...SONG, ...SONGX, ...SU.slice(0, 600), ...XIN.slice(0, 600)].map(([c]) => c))
-
-/* ---- 额外库：全库 top2000 − 九库并集；排除字强制保底 ---- */
-const extraClean = allFreq.slice(0, TOP_N).filter(([c]) => !unionSet.has(c))
+/* ---- 额外库：全库 top2000 全量（运行时按勾选的基础库并集剔除）；排除字强制保底 ---- */
+const extraClean = allFreq.slice(0, TOP_N)
 /* 排除字若因频次不足 top2000 而缺失 → 按真实频次强制插入 */
 const forced = []
 const extraWithBan = [...extraClean]
