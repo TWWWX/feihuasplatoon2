@@ -65,7 +65,11 @@ export const XUANJI_STR =
   + "怀悲哀声殊乖分圣赀何情忧感惟哀志节上通神祇推持所贞记自恭江"
   + "所春伤应翔雁归皇辞成者作体下遗葑菲采者无差生从是敬孝为基湘"
   + "亲刚柔有女为贱人房幽处己悯微身长路悲旷感生民梁山殊塞隔河津"
+/* 璇玑图·去重版：原文 841 字去重后的 463 字（保留首现顺序），与九库同级作普通字库：
+   可与其他库组合、标准洗牌铺盘、标准命中规则（不锁尺寸、可用额外字与换字）。 */
+export const XUANJI_UQ_STR = Array.from(new Set(XUANJI_STR)).join('')
 export const POOL_GROUPS = {
+  xuanji_uq: Array.from(XUANJI_UQ_STR),
   tang: Array.from(POOL_TANG_STR),
   song: Array.from(POOL_SONG_STR),
   su: Array.from(POOL_SU_STR),

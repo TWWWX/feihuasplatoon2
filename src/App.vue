@@ -165,7 +165,7 @@ function localToCloudState() {
     side: gameState.side,
     totalRounds: 0,
     endless: true,
-    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0) | (poolSel.value.xuanji ? 512 : 0),
+    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0) | (poolSel.value.xuanji ? 512 : 0) | (poolSel.value.xuanji_uq ? 1024 : 0),
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -761,9 +761,10 @@ const POOL_OPTIONS = [
   { key: 'xin', label: '辛弃疾词 1–200' },
   { key: 'xin2', label: '辛弃疾词 201–400' },
   { key: 'xin3', label: '辛弃疾词 401–600' },
-  { key: 'xuanji', label: '璇玑图（固定盘）' },
+  { key: 'xuanji_uq', label: '璇玑图（去重）' },
+  { key: 'xuanji', label: '璇玑图29×29' },
 ]
-const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji: false }) // 默认九库全选
+const poolSel = ref({ tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji_uq: true, xuanji: false }) // 默认十字库全选（不含固定盘）
 const activePool = computed(() => {
   /* 璇玑图固定盘：原文原样（保留重复字与顺序），不走并集去重 */
   if (poolSel.value.xuanji) return Array.from(XUANJI_STR)
@@ -798,7 +799,7 @@ function togglePool(key) {
       applySize()
       redrawBoard()
       syncState()
-      flashTip('已切换到璇玑图固定盘：29×29 原文 841 字，顺序固定、不随机、不掺额外字。', 'ok')
+      flashTip('已切换到璇玑图29×29：原文 841 字，顺序固定、不随机、不掺额外字。', 'ok')
       return
     }
   } else {
@@ -811,14 +812,14 @@ function togglePool(key) {
 }
 function selectAllPools() {
   if (gameState.phase !== 'ready') return
-  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji: false }
+  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, xuanji_uq: true, xuanji: false }
   redrawBoard()
   syncState()
 }
 function applyPoolMask(mask) {
-  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256 xuanji=512；
-     旧对局(0-511)无 xuanji 位，解析为未勾；xuanji 对局 side 恒为 29 */
-  const m = typeof mask === 'number' && mask >= 0 && mask <= 1023 ? mask : 511
+  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256 xuanji=512 xuanji_uq=1024；
+     旧对局(0-1023)无 xuanji_uq 位，解析为未勾；xuanji 对局 side 恒为 29 */
+  const m = typeof mask === 'number' && mask >= 0 && mask <= 2047 ? mask : 511
   poolSel.value = {
     tang: !!(m & 1),
     song: !!(m & 2),
@@ -830,6 +831,7 @@ function applyPoolMask(mask) {
     su3: !!(m & 128),
     xin3: !!(m & 256),
     xuanji: !!(m & 512),
+    xuanji_uq: !!(m & 1024),
   }
 }
 
@@ -1695,18 +1697,18 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
           <details>
             <summary>基础字库（{{ poolPanelList.length }} 字）</summary>
             <div class="detbody">
-              <div class="poolpick" :title="gameState.phase === 'ready' ? '勾选参与抽样的字库集合（并集去重）；璇玑图只能单独选择；随房间同步双方' : '仅待开局时可调整'">
+              <div class="poolpick" :title="gameState.phase === 'ready' ? '勾选参与抽样的字库集合（并集去重）；璇玑图29×29 只能单独选择；随房间同步双方' : '仅待开局时可调整'">
                 <button v-for="opt in POOL_OPTIONS" :key="opt.key" :class="{ on: poolSel[opt.key] }"
                         :disabled="gameState.phase !== 'ready'" @click="togglePool(opt.key)">{{ opt.label }}</button>
                 <button class="primary" :disabled="gameState.phase !== 'ready'"
-                        @click="selectAllPools" title="九库全部参与（默认，不含璇玑图）">全选</button>
+                        @click="selectAllPools" title="全部普通字库参与（默认，不含璇玑图29×29）">全选</button>
               </div>
               <div class="poolgrid swap">
                 <span v-for="ch in poolPanelList" :key="ch" :class="{ on: poolOn[ch] && !removedChars.has(ch) }"
                       :title="poolSel.xuanji ? '璇玑图固定盘，不支持换字' : (poolOn[ch] ? (removedChars.has(ch) ? '已取消，点击恢复' : '点击取消棋盘上的该字') : '点击用该字补位被取消的棋盘字')"
                       @click="onPoolSwapPick(ch)">{{ ch }}</span>
               </div>
-              <p v-if="poolSel.xuanji" class="poolnote">璇玑图模式：棋盘固定为 29×29 的《璇玑图》原文 841 字（按行原文、顺序固定、不随机、不掺额外字、不支持换字，尺寸与额外字输入已锁定）。命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格。</p>
+              <p v-if="poolSel.xuanji" class="poolnote">璇玑图29×29 模式：棋盘固定为 29×29 的《璇玑图》原文 841 字（按行原文、顺序固定、不随机、不掺额外字、不支持换字，尺寸与额外字输入已锁定）。命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格。</p>
               <p class="poolnote">勾选的字库集合取并集去重后构成基础字库。开局前可换字：点棋盘上（或下方字库里）不要的字取消选中，再点别的字补位；取消与补位数量相等（棋盘无空缺）才能开局。换字只影响本盘，重抽/再来一局会重铺。</p>
             </div>
           </details>
@@ -1727,10 +1729,10 @@ onMounted(() => window.addEventListener('resize', sizeCellFont))
             <summary>规则与判定逻辑</summary>
             <div class="detbody">
               <ol class="rules">
-                <li>棋盘：从<b>基础字库</b>（默认为「全唐诗 300 + 全宋词 300 + 宋词 300·不含唐诗字 + 苏轼词 1–200 / 201–400 / 401–600 + 辛弃疾词 1–200 / 201–400 / 401–600」九库并集去重，可在「基础字库」面板勾选参与集合）中<b>随机抽 N×N 个不重复的字</b>铺成方阵（N 可在顶栏设 5–20）。顶栏「<b>额外字</b>」可指定其中 K 格改从<b>额外字池</b>（自动避开已选基础字库）里抽 —— 抽取<b>按唐诗与宋词合计频次加权</b>，越常见的字越容易被抽中。</li>
-                <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色（璇玑图模式除外，见下）。</li>
+                <li>棋盘：从<b>基础字库</b>（默认为「全唐诗 300 + 全宋词 300 + 宋词 300·不含唐诗字 + 苏轼词 1–200 / 201–400 / 401–600 + 辛弃疾词 1–200 / 201–400 / 401–600 + 璇玑图·去重」十字库并集去重，可在「基础字库」面板勾选参与集合）中<b>随机抽 N×N 个不重复的字</b>铺成方阵（N 可在顶栏设 5–20）。顶栏「<b>额外字</b>」可指定其中 K 格改从<b>额外字池</b>（自动避开已选基础字库）里抽 —— 抽取<b>按唐诗与宋词合计频次加权</b>，越常见的字越容易被抽中。</li>
+                <li>涂色：某人飞出一句后，<b>诗句中所有出现在棋盘上的字</b>，对应格子全部涂成该方颜色（璇玑图29×29 模式除外，见下）。</li>
                 <li>合法性：本句命中棋盘的字中，<b>至少要有 1 个格子当前未填色</b>；命中已涂色格可以抢夺。若命中格全都是已有颜色，本句无效。</li>
-                <li>璇玑图模式：勾选「<b>璇玑图（固定盘）</b>」时只能单选此库，棋盘固定为 <b>29×29 的《璇玑图》原文 841 字</b>——按行原文、顺序固定不随机、不掺额外字、不支持换字、尺寸锁定 29。此模式下命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格；其余规则不变。</li>
+                <li>璇玑图29×29 模式：勾选「<b>璇玑图29×29</b>」时只能单选此库，棋盘固定为 <b>29×29 的《璇玑图》原文 841 字</b>——按行原文、顺序固定不随机、不掺额外字、不支持换字、尺寸锁定 29。此模式下命中规则改为<b>每字只涂一个格</b>：优先占该字最靠前的空白格（从左到右、从上到下），无空白则抢最靠前的对方格，该字全归己方则记己方格；其余规则不变。另有「<b>璇玑图（去重）</b>」为普通字库：原文去重后的 463 字，可与其他库组合、标准洗牌与命中规则。</li>
                 <li>胜负：不限轮数，点「<b>结算</b>」随时结束本局，<b>己方颜色格子多者胜</b>；等同则平局。</li>
                 <li>离线：对方<b>断开连接</b>（关闭页面、断网等）即在队名处显示「离线」，对战<b>不会暂停</b>，可直接继续提交；离线满 <b>1 分钟</b>，队名处出现「<b>踢出</b>」按钮，可手动将其移出房间（不自动踢出）。踢出或被新人<b>顶替</b>后席位空出；若被移出者是房主，房主随之转让。新成员加入时自动顶替离线者（双方离线时优先顶替离线更久者）；赤青两席<b>都有人且在线</b>时不允许第三人加入。双方都不在线满 24 小时的房间会被清理。</li>
               </ol>
