@@ -1,8 +1,9 @@
 /* 重建九库 + 补充库 + 额外字库（统一口径，替代逐库手工维护）：
    语料：御定全唐詩/json（唐诗）· 宋词 ci.song.*.json（宋词/苏轼/辛弃疾）· chinese-poetry 全库（额外库）
    文本层：词级繁转简（opencc t2s，词级保护「乾坤」等词）+ 变体映射 馀→余、锺→钟、敧→欹（於→由 t2s 完成）。
-   移字：pools.js 的 REMOVED_FROM_POOLS 为唯一配置源——chars 剔除出九库并归入额外库（全库频次不足
-     top2000 者按真实频次强制插入额外库对应位置）；其中 pools 含 songx 且 fill=false 表示
+   移字：pools.js 的 REMOVED_FROM_POOLS 为唯一配置源——chars 剔除出九库（pools 含 'qianzi' 者除外，
+     千字文由手工维护）并归入额外库（全库频次不足 top2000 者按真实频次强制插入额外库对应位置）；
+     其中 pools 含 songx 且 fill=false 表示
      「宋词 300·不含唐诗字」只删不补（该库容量减 1），其余库剔除后自动顺延补位。
    九库规则（与既有口径一致，苏辛六库已验证可完全复现）：
      TANG = 唐诗 top300；SONG = 宋词 top300；SONGX = 宋词 top300 中非 TANG 字；
@@ -29,6 +30,8 @@ const src = readFileSync(POOLS_FILE, 'utf8')
 const removed = [...src.matchAll(/\{ date: '([^']*)', chars: '([^']+)', pools: '([^']+)', fill: (true|false)/g)]
   .map(([, date, chars, pools, fill]) => ({ date, chars: [...chars], pools, fill: fill === 'true' }))
 const BAN = new Set(removed.flatMap((r) => r.chars))
+/* 九库剔除范围：pools 含 'qianzi' 的条目只做额外库保底，不影响九库 */
+const NINE_BAN = new Set(removed.filter((r) => !/qianzi/.test(r.pools)).flatMap((r) => r.chars))
 /* 只删不补的库：仅 SONGX 支持（其余库按词频顺延补位） */
 const SONGX_NO_FILL = new Set(removed.filter((r) => /songx/.test(r.pools) && !r.fill).flatMap((r) => r.chars))
 
@@ -78,7 +81,7 @@ const suFreq = countIn(ciFiles, '苏轼')
 const xinFreq = countIn(ciFiles, '辛弃疾')
 
 /* ---- 九库选择（排除字剔除；SONGX 的 no-fill 字在切片后移除，不补位） ---- */
-const banFill = new Set([...BAN].filter((c) => !SONGX_NO_FILL.has(c)))
+const banFill = new Set([...NINE_BAN].filter((c) => !SONGX_NO_FILL.has(c)))
 const notBan = (list) => list.filter(([c]) => !banFill.has(c))
 const TANG = notBan(tangFreq).slice(0, 300)
 const SONG = notBan(ciFreq).slice(0, 300)
