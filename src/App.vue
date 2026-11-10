@@ -165,7 +165,7 @@ function localToCloudState() {
     side: gameState.side,
     totalRounds: 0,
     endless: true,
-    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0) | (poolSel.value.xuanji ? 512 : 0) | (poolSel.value.xuanji_uq ? 1024 : 0) | (poolSel.value.qianzi ? 2048 : 0),
+    poolMask: (poolSel.value.tang ? 1 : 0) | (poolSel.value.song ? 2 : 0) | (poolSel.value.su ? 4 : 0) | (poolSel.value.xin ? 8 : 0) | (poolSel.value.songx ? 16 : 0) | (poolSel.value.su2 ? 32 : 0) | (poolSel.value.xin2 ? 64 : 0) | (poolSel.value.su3 ? 128 : 0) | (poolSel.value.xin3 ? 256 : 0) | (poolSel.value.xuanji ? 512 : 0) | (poolSel.value.xuanji_uq ? 1024 : 0) | (poolSel.value.qianzi ? 2048 : 0) | (poolSel.value.shenglv ? 4096 : 0) | (poolSel.value.liweng ? 8192 : 0),
     board: gameState.board.map((c) => ({
       ch: c.ch,
       owner: c.owner === 'A' ? 'red' : c.owner === 'B' ? 'blue' : null,
@@ -762,11 +762,13 @@ const POOL_OPTIONS = [
   { key: 'xin', label: '辛弃疾词 1–200' },
   { key: 'xin2', label: '辛弃疾词 201–400' },
   { key: 'xin3', label: '辛弃疾词 401–600' },
+  { key: 'shenglv', label: '声律启蒙' },
+  { key: 'liweng', label: '笠翁对韵' },
   { key: 'qianzi', label: '千字文' },
   { key: 'xuanji_uq', label: '璇玑图' },
   { key: 'xuanji', label: '璇玑图29×29' },
 ]
-const poolSel = ref({ tang: true, song: true, songx: false, su: true, su2: false, su3: false, xin: true, xin2: false, xin3: false, qianzi: false, xuanji_uq: false, xuanji: false }) // 默认四库：唐诗三百 + 宋词三百 + 苏辛 1–200
+const poolSel = ref({ tang: true, song: true, songx: false, su: true, su2: false, su3: false, xin: true, xin2: false, xin3: false, shenglv: false, liweng: false, qianzi: false, xuanji_uq: false, xuanji: false }) // 默认四库：唐诗三百 + 宋词三百 + 苏辛 1–200
 const activePool = computed(() => {
   /* 璇玑图固定盘：原文原样（保留重复字与顺序），不走并集去重 */
   if (poolSel.value.xuanji) return Array.from(XUANJI_STR)
@@ -814,14 +816,14 @@ function togglePool(key) {
 }
 function selectAllPools() {
   if (gameState.phase !== 'ready') return
-  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, qianzi: true, xuanji_uq: true, xuanji: false }
+  poolSel.value = { tang: true, song: true, songx: true, su: true, su2: true, su3: true, xin: true, xin2: true, xin3: true, shenglv: true, liweng: true, qianzi: true, xuanji_uq: true, xuanji: false }
   redrawBoard()
   syncState()
 }
 function applyPoolMask(mask) {
-  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256 xuanji=512 xuanji_uq=1024 qianzi=2048；
-     旧对局(0-2047)无 qianzi 位，解析为未勾；xuanji 对局 side 恒为 29 */
-  const m = typeof mask === 'number' && mask >= 0 && mask <= 4095 ? mask : 511
+  /* 按位解析：tang=1 song=2 su=4 xin=8 songx=16 su2=32 xin2=64 su3=128 xin3=256 xuanji=512 xuanji_uq=1024 qianzi=2048 shenglv=4096 liweng=8192；
+     旧对局无新增位，解析为未勾；xuanji 对局 side 恒为 29 */
+  const m = typeof mask === 'number' && mask >= 0 && mask <= 16383 ? mask : 511
   poolSel.value = {
     tang: !!(m & 1),
     song: !!(m & 2),
@@ -835,6 +837,8 @@ function applyPoolMask(mask) {
     xuanji: !!(m & 512),
     xuanji_uq: !!(m & 1024),
     qianzi: !!(m & 2048),
+    shenglv: !!(m & 4096),
+    liweng: !!(m & 8192),
   }
 }
 
